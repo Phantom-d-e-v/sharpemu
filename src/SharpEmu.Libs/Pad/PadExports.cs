@@ -6,6 +6,7 @@ using SharpEmu.HLE.Host;
 using SharpEmu.Libs.SystemService;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 
 namespace SharpEmu.Libs.Pad;
@@ -706,12 +707,27 @@ public static class PadExports
                     _stallReported = false;
                 }
 
-                // Heartbeat: prove progress even on the static splash.
+                // Heartbeat: prove progress even on the static splash, and
+                // surface any blocked/non-running threads + top importers.
                 if ((DateTime.UtcNow - _lastHeartbeat).TotalSeconds >= 5)
                 {
                     _lastHeartbeat = DateTime.UtcNow;
                     var flips = SharpEmu.Libs.VideoOut.VideoOutExports.DiagnosticFlipCount;
                     Console.Error.WriteLine($"[DIAG][HEARTBEAT] maxImport={maxImport} threads={snapshots.Count} flips={flips} stall={(DateTime.UtcNow - _lastProgressTime).TotalSeconds:F0}s");
+                    // Top importers (which threads are actually doing work).
+                    var top = snapshots.OrderByDescending(s => s.ImportCount).Take(4).ToArray();
+                    foreach (var s in top)
+                    {
+                        Console.Error.WriteLine($"[DIAG][HB] top thread='{s.Name}' imports={s.ImportCount} lastNid={s.LastImportNid}");
+                    }
+                    // Any non-running threads (blocked/waiting) - these are suspects.
+                    foreach (var s in snapshots)
+                    {
+                        if (!string.Equals(s.State, "Running", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Console.Error.WriteLine($"[DIAG][HB] BLOCKED thread='{s.Name}' state={s.State} imports={s.ImportCount} lastNid={s.LastImportNid} block={s.BlockReason ?? \"-\"}");
+                        }
+                    }
                 }
 
                 if ((DateTime.UtcNow - _lastProgressTime).TotalSeconds < 10 || _stallReported)
