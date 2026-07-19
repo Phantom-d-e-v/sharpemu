@@ -617,19 +617,8 @@ public static class AvPlayerExports
             var hostPath = ResolveGuestPath(guestPath);
             if (hostPath is null || !ProbeVideo(hostPath, out var width, out var height, out var fps, out var duration))
             {
-                // The decoder/FFmpeg is unavailable or the source could not be
-                // probed. Rather than fail the open (which makes titles assert
-                // on VideoPlayer init and AV), mark the player as an already
-                // finished stream so the game skips the intro and continues.
-                Console.Error.WriteLine($"[AVPLAYER][WARN] Could not open guest video '{guestPath}' (resolved '{hostPath ?? "<none>"}'); skipping playback.");
-                player.ResetPlayback();
-                player.SourcePath = null;
-                player.EndOfStream = true;
-                player.Started = false;
-                autoStart = false;
-                NotifyEvent(ctx, player, 2); // StateReady
-                NotifyEvent(ctx, player, 5); // StateFinish
-                return SetReturn(ctx, 0);
+                Console.Error.WriteLine($"[AVPLAYER][ERROR] Could not open guest video '{guestPath}' (resolved '{hostPath ?? "<none>"}').");
+                return SetReturn(ctx, OperationFailed);
             }
 
             player.ResetPlayback();
