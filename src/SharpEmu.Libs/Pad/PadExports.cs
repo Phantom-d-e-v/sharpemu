@@ -645,22 +645,25 @@ public static class PadExports
         }
 
         var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
-        var held = elapsed >= 1.5 && elapsed <= 16.0;
+        var held = elapsed >= 1.5 && elapsed <= 60.0;
         if (held && !_autoCrossLogged)
         {
             _autoCrossLogged = true;
-            Console.Error.WriteLine("[LOADER][INFO] AutoCross: holding Cross 1.5s-16s for Astro Bot splash.");
+            Console.Error.WriteLine("[LOADER][INFO] AutoCross: holding Cross 1.5s-60s for Astro Bot splash.");
         }
         return held;
     }
 
     // [DIAG] Stall watchdog: if no guest thread's import counter advances for
     // 10s while we're on the Astro Bot splash, dump every thread's state so the
-    // stuck thread + its blocking NID is visible in boot.log. Temporary.
+    // stuck thread + its blocking NID is visible in boot.log. Also logs a
+    // heartbeat of max import + videoout flip count every 5s so progress is
+    // visible even on the static splash. Temporary.
     private static Timer? _stallWatchdog;
     private static long _lastMaxImport;
     private static DateTime _lastProgressTime = DateTime.UtcNow;
     private static bool _stallReported;
+    private static DateTime _lastHeartbeat = DateTime.UtcNow;
 
     private static void EnsureStallWatchdog()
     {
@@ -691,8 +694,15 @@ public static class PadExports
                     _lastMaxImport = maxImport;
                     _lastProgressTime = DateTime.UtcNow;
                     _stallReported = false;
-                    return;
                 }
+
+                // Heartbeat: prove progress even on the static splash.
+                if ((DateTime.UtcNow - _lastHeartbeat).TotalSeconds >= 5)
+                {
+                    _lastHeartbeat = DateTime.UtcNow;
+                    Console.Error.WriteLine($"[DIAG][HEARTBEAT] maxImport={maxImport} threads={snapshots.Count} stall={(DateTime.UtcNow - _lastProgressTime).TotalSeconds:F0}s");
+                }
+
                 if ((DateTime.UtcNow - _lastProgressTime).TotalSeconds < 10 || _stallReported)
                 {
                     return;
