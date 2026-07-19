@@ -677,20 +677,18 @@ public static class KernelPthreadCompatExports
 
                 if (state.Type is MutexTypeNormal or MutexTypeAdaptiveNp)
                 {
-                    if (tryOnly)
-                    {
-                        TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
-                        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
-                    }
-
-                    // Several Gen5 runtimes layer their own owner/count bookkeeping
-                    // over a NORMAL or ADAPTIVE kernel mutex. Returning EDEADLK here
-                    // leaves that guest bookkeeping out of sync with the HLE owner and
-                    // turns the wrapper into a permanent lock/unlock retry loop. Keep
-                    // the compatibility recursion used by the original implementation;
-                    // ERRORCHECK mutexes still take the strict EDEADLK path below.
+                    // Treat a self-owned normal/adaptive mutex as compatible
+                    // recursion for BOTH lock and trylock. The kernel mutex word
+                    // is also manipulated by the guest's userspace fast-path
+                    // (atomic ops that never reach HLE), so the HLE owner bookkeeping
+                    // can drift out of sync with real ownership. Returning BUSY on a
+                    // self-owned trylock strands the caller in a permanent
+                    // trylock->unlock retry spin (observed: SceSndzAudioOutMain
+                    // busy-loops on scePthreadMutexTrylock while every worker thread
+                    // is blocked). Mirror the compatibility recursion the blocking
+                    // lock already applies below.
                     state.RecursionCount++;
-                    TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                    TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
                 else
