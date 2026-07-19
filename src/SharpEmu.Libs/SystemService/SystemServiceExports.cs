@@ -19,6 +19,8 @@ public static class SystemServiceExports
 
     private static string? _mainAppTitleId;
 
+    public static string? MainAppTitleId => _mainAppTitleId;
+
     public static void ConfigureApplicationInfo(string? titleId)
     {
         _mainAppTitleId = string.IsNullOrWhiteSpace(titleId) ? null : titleId.Trim();

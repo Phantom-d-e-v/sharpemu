@@ -20,6 +20,16 @@ public static class AvPlayerExports
     private const int StreamInfoSize = 40;
     private const int MaxGuestPathLength = 4096;
     private static readonly object StateGate = new();
+
+    // Astro Bot (PPSA21564) has a guest AvPlayer texture allocator callback that
+    // trips a stack canary / CPU trap when invoked, freezing the emulator on the
+    // boot splash. For that title we never call the guest allocator and stop
+    // delivering video frames so the game advances to gameplay.
+    private static bool IsAvPlayerTextureAllocatorBroken()
+    {
+        var title = SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId;
+        return string.Equals(title, "PPSA21564", StringComparison.OrdinalIgnoreCase);
+    }
     private static readonly Dictionary<ulong, PlayerState> Players = new();
     private static int _traceCount;
 
@@ -50,6 +60,11 @@ public static class AvPlayerExports
         public byte[]? PaddedFrame { get; set; }
         public ulong[] GuestBuffers { get; } = new ulong[FrameBufferCount];
         public bool TextureAllocatorFailed { get; set; }
+        // Once the guest texture allocator fails (or any video-frame delivery
+        // trips a guest stack canary), stop handing frames to the game entirely.
+        // Returning "no frame" lets titles that render video as an overlay advance
+        // past the clip instead of hard-freezing on the splash.
+        public bool VideoDeliveryDisabled { get; set; }
         public int GuestBufferStride { get; set; }
         public int NextGuestBuffer { get; set; }
         public ulong LastGuestBuffer { get; set; }
@@ -137,6 +152,7 @@ public static class AvPlayerExports
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 24, out var allocateTexture) ? allocateTexture : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 80, out var eventObject) ? eventObject : 0,
                 EventCallback = TryReadUInt64(ctx, initDataAddress + 88, out var eventCallback) ? eventCallback : 0,
+                VideoDeliveryDisabled = IsAvPlayerTextureAllocatorBroken(),
             });
         }
 
@@ -191,6 +207,7 @@ public static class AvPlayerExports
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 32, out var allocateTexture) ? allocateTexture : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 88, out var eventObject) ? eventObject : 0,
                 EventCallback = TryReadUInt64(ctx, initDataAddress + 96, out var eventCallback) ? eventCallback : 0,
+                VideoDeliveryDisabled = IsAvPlayerTextureAllocatorBroken(),
             });
         }
 
@@ -653,6 +670,15 @@ public static class AvPlayerExports
                 return SetReturn(ctx, 0);
             }
 
+            // The guest texture allocator is broken for this title (calling it
+            // trips a guest stack canary / CPU trap and freezes boot on the
+            // splash). Stop delivering video frames so the game advances past
+            // the intro clip instead of crashing.
+            if (player.VideoDeliveryDisabled)
+            {
+                return SetReturn(ctx, 0);
+            }
+
             if (!EnsureDecoder(player))
             {
                 player.EndOfStream = true;
@@ -965,6 +991,11 @@ public static class AvPlayerExports
                         $"[AVPLAYER][ERROR] Guest texture allocation failed index={index} " +
                         $"callback=0x{player.AllocateTextureCallback:X16}: {error ?? "returned null"}");
                     player.TextureAllocatorFailed = true;
+                    // The guest allocator callback is unsafe for this title
+                    // (trips a guest stack canary / CPU trap). Disable video
+                    // delivery so the game advances past the intro instead of
+                    // hard-freezing on the splash.
+                    player.VideoDeliveryDisabled = true;
                     Array.Clear(player.GuestBuffers);
                     break;
                 }
