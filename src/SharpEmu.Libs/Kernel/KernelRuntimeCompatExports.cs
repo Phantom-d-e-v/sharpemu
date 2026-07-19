@@ -1251,7 +1251,7 @@ public static class KernelRuntimeCompatExports
             try
             {
                 ulong retAddr = 0;
-                if (ctx.TryReadUInt64(ctx.Rsp, out retAddr))
+                if (ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out retAddr))
                     NeutralizeAstroBotCanaryCheck(retAddr - 0x1CuL);
             }
             catch
