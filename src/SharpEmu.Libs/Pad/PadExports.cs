@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.HLE.Host;
+using SharpEmu.Libs.SystemService;
 using System.Buffers.Binary;
 using System.Diagnostics;
 
