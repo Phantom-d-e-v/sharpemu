@@ -12,6 +12,12 @@ namespace SharpEmu.Libs.Pad;
 
 public static class PadExports
 {
+    // [DIAG] Start the stall watchdog at module load (unconditional) so it
+    // runs even if the game stops polling pad input. Temporary.
+    static PadExports()
+    {
+        EnsureStallWatchdog();
+    }
     private const int OrbisPadErrorInvalidHandle = unchecked((int)0x80920003);
     private const int OrbisPadErrorNotInitialized = unchecked((int)0x80920005);
     private const int OrbisPadErrorDeviceNotConnected = unchecked((int)0x80920007);
@@ -667,7 +673,7 @@ public static class PadExports
 
     private static void EnsureStallWatchdog()
     {
-        if (_stallWatchdog is not null || SystemServiceExports.MainAppTitleId != "PPSA21564")
+        if (_stallWatchdog is not null)
         {
             return;
         }
@@ -675,6 +681,10 @@ public static class PadExports
         {
             try
             {
+                if (SystemServiceExports.MainAppTitleId != "PPSA21564")
+                {
+                    return;
+                }
                 var scheduler = GuestThreadExecution.Scheduler;
                 if (scheduler is null)
                 {
