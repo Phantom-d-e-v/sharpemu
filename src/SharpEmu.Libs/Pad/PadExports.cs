@@ -732,13 +732,24 @@ public static class PadExports
                     Console.Error.WriteLine($"[DIAG][THREADS] === end (maxImport={maxImport}) ===");
 
                     // [DIAG] Dump the recent import loop of the conductor thread so we
-                    // can see exactly what it's spinning on.
+                    // can see exactly what it's spinning on. Collapse consecutive
+                    // duplicates so the loop STRUCTURE is visible (e.g. unlock*N vs
+                    // unlock->lock->unlock).
                     foreach (var s in snapshots)
                     {
                         if (string.Equals(s.Name, "SceSndzAudioOutMain", StringComparison.OrdinalIgnoreCase) && s.RecentNids != null && s.RecentNids.Count > 0)
                         {
-                            var loop = string.Join(" -> ", s.RecentNids);
-                            Console.Error.WriteLine($"[DIAG][AUDIOLOOP] SceSndzAudioOutMain recent imports: {loop}");
+                            var collapsed = new List<string>();
+                            foreach (var n in s.RecentNids)
+                            {
+                                if (n == null) continue;
+                                if (collapsed.Count == 0 || collapsed[^1] != n)
+                                    collapsed.Add(n);
+                                else
+                                    collapsed[^1] = n + "*";
+                            }
+                            var loop = string.Join(" -> ", collapsed);
+                            Console.Error.WriteLine($"[DIAG][AUDIOLOOP] SceSndzAudioOutMain loop(dedup): {loop}");
                         }
                     }
                 }
