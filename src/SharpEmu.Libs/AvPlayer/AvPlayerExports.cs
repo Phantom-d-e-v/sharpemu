@@ -1014,10 +1014,14 @@ public static class AvPlayerExports
             return false;
         }
         Console.Error.WriteLine($"[AVPLAYER][DIAG] ffmpeg resolved to '{ffmpeg}'");
-        var ffprobe = Path.Combine(Path.GetDirectoryName(ffmpeg) ?? string.Empty, "ffprobe");
-        if (!File.Exists(ffprobe))
+        var ffprobeDir = Path.GetDirectoryName(ffmpeg) ?? string.Empty;
+        // Accept both 'ffprobe' and 'ffprobe.exe' so Windows installs
+        // (where the binary is ffprobe.exe) are detected.
+        var ffprobe = new[] { Path.Combine(ffprobeDir, "ffprobe"), Path.Combine(ffprobeDir, "ffprobe.exe") }
+            .FirstOrDefault(File.Exists);
+        if (ffprobe is null)
         {
-            Console.Error.WriteLine($"[AVPLAYER][DIAG] ffprobe not found at '{ffprobe}' (required beside ffmpeg)");
+            Console.Error.WriteLine($"[AVPLAYER][DIAG] ffprobe not found beside ffmpeg ('{Path.Combine(ffprobeDir, "ffprobe")}' / '{Path.Combine(ffprobeDir, "ffprobe.exe")}')");
             return false;
         }
         Console.Error.WriteLine($"[AVPLAYER][DIAG] ffprobe at '{ffprobe}', probing '{path}'");
