@@ -1171,42 +1171,33 @@ public static class KernelRuntimeCompatExports
     public static int StackCheckFail(CpuContext ctx)
     {
         var count = Interlocked.Increment(ref _stackChkFailCount);
-        var rbpDiag = ctx[CpuRegister.Rbp];
-        var rspDiag = ctx[CpuRegister.Rsp];
-        Console.Error.WriteLine(
-            $"[LOADER][ERROR] __stack_chk_fail#{count}: rip=0x{ctx.Rip:X16} rdi=0x{ctx[CpuRegister.Rdi]:X16} rbp=0x{rbpDiag:X16} rsp=0x{rspDiag:X16} title={SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId}");
-        if (rbpDiag != 0 && ctx.TryReadUInt64(rbpDiag + 8, out var dbgCaller))
-            Console.Error.WriteLine($"[DIAG] __stack_chk_fail#{count}: [rbp+8]=0x{dbgCaller:X16}");
-        else
-            Console.Error.WriteLine($"[DIAG] __stack_chk_fail#{count}: rbp==0 or read failed");
-        if (rspDiag != 0 && ctx.TryReadUInt64(rspDiag, out var dbgStackRet))
-            Console.Error.WriteLine($"[DIAG] __stack_chk_fail#{count}: [rsp]=0x{dbgStackRet:X16}");
-        else
-            Console.Error.WriteLine($"[DIAG] __stack_chk_fail#{count}: rsp==0 or read failed");
 
         // Astro Bot (PPSA21564): the game trips a stack canary in one of its own
-        // functions during gameplay init. The function sits on a standard frame
-        // (return address at [rbp+8]), so we unwind to the caller and continue
-        // instead of raising a fatal CPU trap that would freeze the emulator.
-        // This is a playable-now mitigation; the underlying cause is a single
-        // game-side buffer overflow that needs upstream investigation.
+        // functions during gameplay init. The HLE import bridge clobbers guest
+        // RBP, but the guest return address is still at [RSP] (pushed by the
+        // original `call __stack_chk_fail`). We unwind to that return site and
+        // continue instead of raising a fatal CPU trap that would freeze the
+        // emulator. This is a playable-now mitigation; the underlying cause is
+        // a single game-side buffer overflow that needs upstream investigation.
         if (string.Equals(
                 SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId,
                 "PPSA21564",
                 StringComparison.OrdinalIgnoreCase))
         {
-            var rbp = ctx[CpuRegister.Rbp];
-            if (rbp != 0 && ctx.TryReadUInt64(rbp + 8, out var callerReturn) && callerReturn != 0)
+            var rsp = ctx[CpuRegister.Rsp];
+            if (rsp != 0 && ctx.TryReadUInt64(rsp, out var callerReturn) && callerReturn != 0)
             {
                 Console.Error.WriteLine(
-                    $"[LOADER][WARN] __stack_chk_fail#{count}: recovering to caller 0x{callerReturn:X16} (PPSA21564 mitigation)");
-                ctx[CpuRegister.Rsp] = rbp + 0x10;
+                    $"[LOADER][WARN] __stack_chk_fail#{count}: recovering to 0x{callerReturn:X16} (PPSA21564 RSP-unwind mitigation)");
                 ctx.Rip = callerReturn;
+                ctx[CpuRegister.Rsp] = rsp + 8; // pop the return address
                 ctx[CpuRegister.Rax] = 0;
                 return 0;
             }
         }
 
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] __stack_chk_fail#{count}: rip=0x{ctx.Rip:X16} rdi=0x{ctx[CpuRegister.Rdi]:X16} rsp=0x{ctx[CpuRegister.Rsp]:X16}");
         var result = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_CPU_TRAP;
         GuestThreadExecution.RequestCurrentEntryExit("__stack_chk_fail", result);
         ctx[CpuRegister.Rax] = unchecked((ulong)result);
