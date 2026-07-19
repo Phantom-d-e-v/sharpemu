@@ -1173,6 +1173,30 @@ public static class KernelRuntimeCompatExports
         var count = Interlocked.Increment(ref _stackChkFailCount);
         Console.Error.WriteLine(
             $"[LOADER][ERROR] __stack_chk_fail#{count}: rip=0x{ctx.Rip:X16} rdi=0x{ctx[CpuRegister.Rdi]:X16}");
+
+        // Astro Bot (PPSA21564): the game trips a stack canary in one of its own
+        // functions during gameplay init. The function sits on a standard frame
+        // (return address at [rbp+8]), so we unwind to the caller and continue
+        // instead of raising a fatal CPU trap that would freeze the emulator.
+        // This is a playable-now mitigation; the underlying cause is a single
+        // game-side buffer overflow that needs upstream investigation.
+        if (string.Equals(
+                SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId,
+                "PPSA21564",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var rbp = ctx[CpuRegister.Rbp];
+            if (rbp != 0 && ctx.TryReadUInt64(rbp + 8, out var callerReturn) && callerReturn != 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] __stack_chk_fail#{count}: recovering to caller 0x{callerReturn:X16} (PPSA21564 mitigation)");
+                ctx[CpuRegister.Rsp] = rbp + 0x10;
+                ctx[CpuRegister.Rip] = callerReturn;
+                ctx[CpuRegister.Rax] = 0;
+                return 0;
+            }
+        }
+
         var result = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_CPU_TRAP;
         GuestThreadExecution.RequestCurrentEntryExit("__stack_chk_fail", result);
         ctx[CpuRegister.Rax] = unchecked((ulong)result);
