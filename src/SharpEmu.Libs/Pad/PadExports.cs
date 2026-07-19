@@ -710,7 +710,8 @@ public static class PadExports
                 if ((DateTime.UtcNow - _lastHeartbeat).TotalSeconds >= 5)
                 {
                     _lastHeartbeat = DateTime.UtcNow;
-                    Console.Error.WriteLine($"[DIAG][HEARTBEAT] maxImport={maxImport} threads={snapshots.Count} stall={(DateTime.UtcNow - _lastProgressTime).TotalSeconds:F0}s");
+                    var flips = SharpEmu.Libs.VideoOut.VideoOutExports.DiagnosticFlipCount;
+                    Console.Error.WriteLine($"[DIAG][HEARTBEAT] maxImport={maxImport} threads={snapshots.Count} flips={flips} stall={(DateTime.UtcNow - _lastProgressTime).TotalSeconds:F0}s");
                 }
 
                 if ((DateTime.UtcNow - _lastProgressTime).TotalSeconds < 10 || _stallReported)
