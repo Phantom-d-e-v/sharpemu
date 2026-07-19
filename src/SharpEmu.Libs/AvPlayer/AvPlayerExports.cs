@@ -21,14 +21,15 @@ public static class AvPlayerExports
     private const int MaxGuestPathLength = 4096;
     private static readonly object StateGate = new();
 
-    // Astro Bot (PPSA21564) has a guest AvPlayer texture allocator callback that
-    // trips a stack canary / CPU trap when invoked, freezing the emulator on the
-    // boot splash. For that title we never call the guest allocator and stop
-    // delivering video frames so the game advances to gameplay.
+    // Astro Bot (PPSA21564) originally had its guest AvPlayer texture allocator
+    // callback disabled because invoking it tripped a stack canary. We now let
+    // the real video pipeline run: AllocateGuestVideoBuffers falls back to
+    // HLE-allocated buffers if the guest allocator fails, so frames still flow
+    // and the game's video-present path completes (it needs a delivered frame
+    // before it will sceVideoOutSubmitFlip). Returning false re-enables decode.
     private static bool IsAvPlayerTextureAllocatorBroken()
     {
-        var title = SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId;
-        return string.Equals(title, "PPSA21564", StringComparison.OrdinalIgnoreCase);
+        return false;
     }
     private static readonly Dictionary<ulong, PlayerState> Players = new();
     private static int _traceCount;
@@ -60,6 +61,7 @@ public static class AvPlayerExports
         public byte[]? PaddedFrame { get; set; }
         public ulong[] GuestBuffers { get; } = new ulong[FrameBufferCount];
         public bool TextureAllocatorFailed { get; set; }
+        public bool DiagnosticFirstFrameLogged { get; set; }
         // Once the guest texture allocator fails (or any video-frame delivery
         // trips a guest stack canary), stop handing frames to the game entirely.
         // Returning "no frame" lets titles that render video as an overlay advance
@@ -914,6 +916,13 @@ public static class AvPlayerExports
         if (player.RawFrame is null)
         {
             return false;
+        }
+
+        // [DIAG] Confirm real frames are delivered to the game (boot gate).
+        if (!player.DiagnosticFirstFrameLogged)
+        {
+            player.DiagnosticFirstFrameLogged = true;
+            Console.Error.WriteLine($"[AVPLAYER][DIAG] first video frame delivered to game handle=0x{player.Handle:X16} w={player.Width} h={player.Height}");
         }
 
         var alignedWidth = AlignUp(player.Width, 16);
