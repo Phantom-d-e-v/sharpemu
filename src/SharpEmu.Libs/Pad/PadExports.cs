@@ -574,10 +574,15 @@ public static class PadExports
     {
         // SHARPEMU_AUTO_CROSS="40,52,64": presses Cross for 0.4s at each
         // second offset from process start. Debug aid for unattended runs.
+        // When unset, default to a repeating Cross tap on Astro Bot's splash
+        // so the title screen advances without manual input (the game waits
+        // on a pad-press that may not arrive from a partially-wired controller).
         var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS");
         if (string.IsNullOrWhiteSpace(raw))
         {
-            return [];
+            return SystemServiceExports.MainAppTitleId == "PPSA21564"
+                ? new[] { 2.0, 5.0, 8.0, 12.0 }
+                : Array.Empty<double>();
         }
 
         var values = new List<double>();
