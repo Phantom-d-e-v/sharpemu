@@ -144,4 +144,26 @@ public static class AstroBotStubs
         SafeZero(ctx, ctx[CpuRegister.Rdi], 0x100);
         return Ok(ctx);
     }
+
+    // SUEVes8gvmw — formatted-buffer write (snprintf/vsnprintf shaped:
+    // rdi=dst buffer, rsi=0, rdx=format string, r8=length (as -8 signed),
+    // r9=0x940). Game blocks on it during boot. Stub: NUL-terminate the
+    // destination and return 0 (chars written) so downstream string logic
+    // sees an empty, valid buffer instead of spinning on NOT_FOUND.
+    [SysAbiExport(
+        Nid = "SUEVes8gvmw",
+        ExportName = "",
+        Target = Generation.Gen5,
+        LibraryName = "libSceLibc")]
+    public static int AstroSUEVes8gvmw(CpuContext ctx)
+    {
+        var dst = ctx[CpuRegister.Rdi];
+        if (dst != 0)
+        {
+            // Write two zero bytes (no single-byte write API); safe NUL term.
+            ctx.TryWriteUInt16(dst, 0);
+        }
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
 }
