@@ -555,6 +555,16 @@ public static class PadExports
             buttons |= 0x4000;
         }
 
+        // [DIAG] Temporary: prove whether Cross reaches the game and whether
+        // the guest polls pad during the splash. Remove after boot confirmed.
+        _padPollCount++;
+        var diagElapsed = (now - PadStartTimestamp) / (double)Stopwatch.Frequency;
+        if (diagElapsed - _lastDiagLog >= 1.0)
+        {
+            _lastDiagLog = diagElapsed;
+            Console.Error.WriteLine($"[DIAG][PAD] t={diagElapsed:F1}s polls={_padPollCount} gamepads={gamepadCount} buttons=0x{buttons:X4} cross={(buttons & 0x4000) != 0}");
+        }
+
         _cachedInputState = new PadState(
             Connected: true,
             Buttons: buttons,
@@ -623,6 +633,8 @@ public static class PadExports
     // the entire boot window so a single early sample can't be missed, and we
     // log the first injection so boot.log proves the press was sent.
     private static bool _autoCrossLogged;
+    private static int _padPollCount;
+    private static double _lastDiagLog;
     private static bool IsAutoCrossHeld()
     {
         if (SystemServiceExports.MainAppTitleId != "PPSA21564")
