@@ -166,4 +166,23 @@ public static class AstroBotStubs
         ctx[CpuRegister.Rax] = 0;
         return 0;
     }
+
+    // 6PBNpsgyaxw — second formatted-buffer write called right after
+    // SUEVes8gvmw during boot (same shape; rdi=dst, rsi=0x1F4 length,
+    // rdx=format string). Same treatment: NUL-terminate dst, return 0.
+    [SysAbiExport(
+        Nid = "6PBNpsgyaxw",
+        ExportName = "",
+        Target = Generation.Gen5,
+        LibraryName = "libSceLibc")]
+    public static int Astro6PBNpsgyaxw(CpuContext ctx)
+    {
+        var dst = ctx[CpuRegister.Rdi];
+        if (dst != 0)
+        {
+            ctx.TryWriteUInt16(dst, 0);
+        }
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
 }
