@@ -6,6 +6,7 @@ using SharpEmu.HLE.Host;
 using SharpEmu.Libs.SystemService;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Threading;
 
 namespace SharpEmu.Libs.Pad;
 
@@ -518,6 +519,7 @@ public static class PadExports
 
     private static PadState ReadHostInputState()
     {
+        EnsureStallWatchdog();
         var now = Stopwatch.GetTimestamp();
         if (_lastInputSampleTicks != 0 && now - _lastInputSampleTicks < InputSampleIntervalTicks)
         {
@@ -650,6 +652,63 @@ public static class PadExports
             Console.Error.WriteLine("[LOADER][INFO] AutoCross: holding Cross 1.5s-16s for Astro Bot splash.");
         }
         return held;
+    }
+
+    // [DIAG] Stall watchdog: if no guest thread's import counter advances for
+    // 10s while we're on the Astro Bot splash, dump every thread's state so the
+    // stuck thread + its blocking NID is visible in boot.log. Temporary.
+    private static Timer? _stallWatchdog;
+    private static long _lastMaxImport;
+    private static DateTime _lastProgressTime = DateTime.UtcNow;
+    private static bool _stallReported;
+
+    private static void EnsureStallWatchdog()
+    {
+        if (_stallWatchdog is not null || SystemServiceExports.MainAppTitleId != "PPSA21564")
+        {
+            return;
+        }
+        _stallWatchdog = new Timer(_ =>
+        {
+            try
+            {
+                var scheduler = GuestThreadExecution.Scheduler;
+                if (scheduler is null)
+                {
+                    return;
+                }
+                var snapshots = scheduler.SnapshotThreads();
+                long maxImport = 0;
+                foreach (var s in snapshots)
+                {
+                    if (s.ImportCount > maxImport)
+                    {
+                        maxImport = s.ImportCount;
+                    }
+                }
+                if (maxImport > _lastMaxImport)
+                {
+                    _lastMaxImport = maxImport;
+                    _lastProgressTime = DateTime.UtcNow;
+                    _stallReported = false;
+                    return;
+                }
+                if ((DateTime.UtcNow - _lastProgressTime).TotalSeconds < 10 || _stallReported)
+                {
+                    return;
+                }
+                _stallReported = true;
+                Console.Error.WriteLine($"[DIAG][STALL] no import progress for 10s (maxImport={maxImport}). Threads={snapshots.Count}");
+                foreach (var s in snapshots)
+                {
+                    Console.Error.WriteLine($"[DIAG][STALL] thread='{s.Name}' state={s.State} imports={s.ImportCount} lastNid={s.LastImportNid} rip=0x{s.LastReturnRip:X16} block={s.BlockReason ?? "-"}");
+                }
+            }
+            catch
+            {
+                // best-effort diagnostic
+            }
+        }, null, 3000, 2000);
     }
 
     /// <summary>Maps the host seam's neutral button flags onto SCE_PAD_BUTTON bits.</summary>
