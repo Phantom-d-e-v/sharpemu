@@ -1190,9 +1190,11 @@ public static class KernelRuntimeCompatExports
     // Uses the same VirtualProtect(RWX) + FlushInstructionCache sequence the
     // direct-execution backend uses to patch guest code in place; without the
     // cache flush the CPU may keep executing the original `ud2` bytes.
-    private static void NeutralizeAstroBotCanaryCheck()
+    private static unsafe void NeutralizeAstroBotCanaryCheck()
     {
-        const ulong jneAddress = 0x0000000800FCB2A8uL;
+        // Fixed guest VA of the canary `jne` (75 15) in the function that trips
+        // __stack_chk_fail on boot. Image base is 0x800000000, so this is stable.
+        var jneAddress = (IntPtr)0x0000000800FCB2A8uL;
         try
         {
             if (!HostMemory.Protect((void*)jneAddress, 2u, HostMemory.PAGE_EXECUTE_READWRITE, out var oldProtect))
@@ -1201,12 +1203,12 @@ public static class KernelRuntimeCompatExports
             }
             try
             {
-                Marshal.WriteByte((nint)jneAddress, 0x90);      // 75 -> NOP
-                Marshal.WriteByte((nint)jneAddress + 1, 0x90);  // 15 -> NOP
+                Marshal.WriteByte(jneAddress, 0x90);      // 75 -> NOP
+                Marshal.WriteByte(jneAddress + 1, 0x90);  // 15 -> NOP
                 HostMemory.FlushInstructionCache((void*)jneAddress, 2u);
                 _astroCanaryCheckNeutralized = true;
                 Console.Error.WriteLine(
-                    $"[LOADER][WARN] PPSA21564 canary check neutralized at 0x{jneAddress:X16} (jne -> nop nop)");
+                    $"[LOADER][WARN] PPSA21564 canary check neutralized at 0x{(ulong)jneAddress:X16} (jne -> nop nop)");
             }
             finally
             {
