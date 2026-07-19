@@ -1007,13 +1007,9 @@ public static class AvPlayerExports
         var ffmpeg = FindFfmpeg();
         if (ffmpeg is null)
         {
-            Console.Error.WriteLine("[AVPLAYER][DIAG] FindFfmpeg returned null. PATH=" +
-                (Environment.GetEnvironmentVariable("PATH") ?? "<empty>") +
-                " SHARPEMU_FFMPEG_PATH=" + (Environment.GetEnvironmentVariable("SHARPEMU_FFMPEG_PATH") ?? "<unset>") +
-                " C:\\ffmpeg exists=" + Directory.Exists("C:\\ffmpeg"));
+            Console.Error.WriteLine("[AVPLAYER][ERROR] FFmpeg was not found. Set SHARPEMU_FFMPEG_PATH or install ffmpeg.");
             return false;
         }
-        Console.Error.WriteLine($"[AVPLAYER][DIAG] ffmpeg resolved to '{ffmpeg}'");
         var ffprobeDir = Path.GetDirectoryName(ffmpeg) ?? string.Empty;
         // Accept both 'ffprobe' and 'ffprobe.exe' so Windows installs
         // (where the binary is ffprobe.exe) are detected.
@@ -1021,10 +1017,9 @@ public static class AvPlayerExports
             .FirstOrDefault(File.Exists);
         if (ffprobe is null)
         {
-            Console.Error.WriteLine($"[AVPLAYER][DIAG] ffprobe not found beside ffmpeg ('{Path.Combine(ffprobeDir, "ffprobe")}' / '{Path.Combine(ffprobeDir, "ffprobe.exe")}')");
+            Console.Error.WriteLine($"[AVPLAYER][ERROR] ffprobe not found beside ffmpeg ('{Path.Combine(ffprobeDir, "ffprobe")}' / '{Path.Combine(ffprobeDir, "ffprobe.exe")}')");
             return false;
         }
-        Console.Error.WriteLine($"[AVPLAYER][DIAG] ffprobe at '{ffprobe}', probing '{path}'");
 
         var startInfo = new ProcessStartInfo(ffprobe)
         {
@@ -1093,11 +1088,6 @@ public static class AvPlayerExports
                         }
                         break;
                 }
-            }
-            Console.Error.WriteLine($"[AVPLAYER][DIAG] ffprobe exit={process.ExitCode} -> width={width} height={height} fps={framesPerSecond} (raw output below)");
-            foreach (var l in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                Console.Error.WriteLine($"[AVPLAYER][DIAG]   {l}");
             }
             return width > 0 && height > 0 && framesPerSecond > 0;
         }

@@ -400,6 +400,34 @@ public static class FontExports
     public static int GetCharGlyphImage(CpuContext ctx) => SetSuccess(ctx);
 
     [SysAbiExport(
+        Nid = "LHDoRWVFGqk",
+        ExportName = "sceFontDeleteGlyph",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int DeleteGlyph(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "C-4Qw5Srlyw",
+        ExportName = "sceFontGenerateCharGlyph",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int GenerateCharGlyph(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "8-zmgsxkBek",
+        ExportName = "sceFontGlyphDefineAttribute",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int GlyphDefineAttribute(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "kAenWy1Zw5o",
+        ExportName = "sceFontRenderCharGlyphImageHorizontal",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int RenderCharGlyphImageHorizontal(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
         Nid = "A+CR5wsReME",
         ExportName = "sceFontRenderChar",
         Target = Generation.Gen5,
