@@ -11393,6 +11393,23 @@ public static partial class AgcExports
         uint owner;
         lock (state.Gate)
         {
+            // Astro Bot (PPSA21564) never calls sceAgcDriverInitResourceRegistration
+            // on its boot path, yet calls sceAgcDriverRegisterOwner immediately. Without
+            // initialization ResourceRegistrationInitialized stays false and every
+            // RegisterOwner fails with INVALID_ARGUMENT, blocking GPU resource
+            // registration and freezing the game on the boot splash. Lazily initialize
+            // on first use so owner registration succeeds.
+            if (!state.ResourceRegistrationInitialized)
+            {
+                state.ResourceRegistrationInitialized = true;
+                state.ResourceRegistrationMaxOwners = 64;
+                state.ResourceOwners.Clear();
+                state.RegisteredResources.Clear();
+                state.DefaultOwner = DefaultAgcOwner;
+                state.NextOwner = 1;
+                state.NextResource = 1;
+            }
+
             if (!state.ResourceRegistrationInitialized ||
                 state.ResourceRegistrationMaxOwners != 0 &&
                 state.ResourceOwners.Count >= state.ResourceRegistrationMaxOwners)
