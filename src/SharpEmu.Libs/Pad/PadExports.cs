@@ -381,6 +381,30 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "znaWI0gpuo8",
+        ExportName = "scePadGetTriggerEffectState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetTriggerEffectState(CpuContext ctx)
+    {
+        // Reports the current DualSense trigger-effect state. We have none
+        // active, so return a zeroed state and success.
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (!IsPrimaryPadHandle(handle))
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+        if (stateAddress != 0)
+        {
+            Span<byte> zero = stackalloc byte[128];
+            zero.Clear();
+            ctx.Memory.TryWrite(stateAddress, zero);
+        }
+        return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
         Nid = "yFVnOdGxvZY",
         ExportName = "scePadSetVibration",
         Target = Generation.Gen4 | Generation.Gen5,
