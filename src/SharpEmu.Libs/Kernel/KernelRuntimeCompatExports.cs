@@ -1173,27 +1173,45 @@ public static class KernelRuntimeCompatExports
         var count = Interlocked.Increment(ref _stackChkFailCount);
 
         // Astro Bot (PPSA21564): the game trips a stack canary in one of its own
-        // functions during gameplay init. The HLE import bridge clobbers guest
-        // RBP, but the guest return address is still at [RSP] (pushed by the
-        // original `call __stack_chk_fail`). We unwind to that return site and
-        // continue instead of raising a fatal CPU trap that would freeze the
-        // emulator. This is a playable-now mitigation; the underlying cause is
-        // a single game-side buffer overflow that needs upstream investigation.
+        // functions during gameplay init (a genuine game-side stack overflow that
+        // corrupts the frame's canary slot). The compiler layout is:
+        //     ... <function epilogue> ... ret
+        //     call __stack_chk_fail      ; taken on mismatch
+        //     ud2                        ; 0F 0B (falls through to next function)
+        // so when we enter here, ctx.Rip == return addr into the `ud2` and
+        // [RSP]   == that ud2 address, [RSP+8] == the function's real caller ret.
+        //
+        // To behave exactly as if the canary had matched, we:
+        //   1. NOP the `call __stack_chk_fail` site so this function never trips
+        //      again on subsequent calls, and
+        //   2. resume at the function's own `ret` (the C3 just before the call),
+        //      with RSP advanced past the ud2 return so `ret` pops the real
+        //      caller address.
+        // This is a playable-now mitigation; the overflow itself needs upstream
+        // investigation.
         if (string.Equals(
                 SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId,
                 "PPSA21564",
                 StringComparison.OrdinalIgnoreCase))
         {
+            // ctx.Rip is the return address pushed by `call` => points at `ud2`.
+            // The `call` opcode is 5 bytes (E8 + rel32); the `ret` is 1 byte (C3)
+            // immediately before it.
+            var callSite = ctx.Rip - 5;
+            var retSite  = ctx.Rip - 6;
+
+            // NOP the call site (E8 CC 0D 52 06 -> 90 90 90 90 90).
+            Span<byte> nops = stackalloc byte[5];
+            for (var i = 0; i < 5; i++) nops[i] = 0x90;
+            _ = ctx.Memory.TryWrite(callSite, nops);
+
             var rsp = ctx[CpuRegister.Rsp];
-            if (rsp != 0 && ctx.TryReadUInt64(rsp, out var callerReturn) && callerReturn != 0)
-            {
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] __stack_chk_fail#{count}: recovering to 0x{callerReturn:X16} (PPSA21564 RSP-unwind mitigation)");
-                ctx.Rip = callerReturn;
-                ctx[CpuRegister.Rsp] = rsp + 8; // pop the return address
-                ctx[CpuRegister.Rax] = 0;
-                return 0;
-            }
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary mismatch @0x{ctx.Rip:X16} — neutralizing call site 0x{callSite:X16}, resuming at ret 0x{retSite:X16}");
+            ctx.Rip = retSite;                 // execute the function's own `ret`
+            ctx[CpuRegister.Rsp] = rsp + 8;    // skip the ud2 return; `ret` pops caller ret
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
         }
 
         Console.Error.WriteLine(
