@@ -1171,8 +1171,18 @@ public static class KernelRuntimeCompatExports
     public static int StackCheckFail(CpuContext ctx)
     {
         var count = Interlocked.Increment(ref _stackChkFailCount);
+        var rbpDiag = ctx[CpuRegister.Rbp];
+        var rspDiag = ctx[CpuRegister.Rsp];
         Console.Error.WriteLine(
-            $"[LOADER][ERROR] __stack_chk_fail#{count}: rip=0x{ctx.Rip:X16} rdi=0x{ctx[CpuRegister.Rdi]:X16}");
+            $"[LOADER][ERROR] __stack_chk_fail#{count}: rip=0x{ctx.Rip:X16} rdi=0x{ctx[CpuRegister.Rdi]:X16} rbp=0x{rbpDiag:X16} rsp=0x{rspDiag:X16} title={SystemServiceExports.MainAppTitleId}");
+        if (rbpDiag != 0 && ctx.TryReadUInt64(rbpDiag + 8, out var dbgCaller))
+            Console.Error.WriteLine($"[DIAG] __stack_chk_fail#{count}: [rbp+8]=0x{dbgCaller:X16}");
+        else
+            Console.Error.WriteLine($"[DIAG] __stack_chk_fail#{count}: rbp==0 or read failed");
+        if (rspDiag != 0 && ctx.TryReadUInt64(rspDiag, out var dbgStackRet))
+            Console.Error.WriteLine($"[DIAG] __stack_chk_fail#{count}: [rsp]=0x{dbgStackRet:X16}");
+        else
+            Console.Error.WriteLine($"[DIAG] __stack_chk_fail#{count}: rsp==0 or read failed");
 
         // Astro Bot (PPSA21564): the game trips a stack canary in one of its own
         // functions during gameplay init. The function sits on a standard frame
