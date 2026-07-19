@@ -730,6 +730,17 @@ public static class PadExports
                         Console.Error.WriteLine($"[DIAG][THREADS] '{s.Name}' imports={s.ImportCount} state={s.State} lastNid={s.LastImportNid ?? "-"} block={s.BlockReason ?? "-"}");
                     }
                     Console.Error.WriteLine($"[DIAG][THREADS] === end (maxImport={maxImport}) ===");
+
+                    // [DIAG] Dump the recent import loop of the conductor thread so we
+                    // can see exactly what it's spinning on.
+                    foreach (var s in snapshots)
+                    {
+                        if (string.Equals(s.Name, "SceSndzAudioOutMain", StringComparison.OrdinalIgnoreCase) && s.RecentNids != null && s.RecentNids.Count > 0)
+                        {
+                            var loop = string.Join(" -> ", s.RecentNids);
+                            Console.Error.WriteLine($"[DIAG][AUDIOLOOP] SceSndzAudioOutMain recent imports: {loop}");
+                        }
+                    }
                 }
 
                 // Stall: if the GLOBAL max hasn't moved for 15s, dump the blocked ones.

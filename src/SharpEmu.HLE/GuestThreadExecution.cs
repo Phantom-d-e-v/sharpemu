@@ -21,7 +21,8 @@ public readonly record struct GuestThreadSnapshot(
     long ImportCount,
     string? LastImportNid,
     ulong LastReturnRip,
-    string? BlockReason);
+    string? BlockReason,
+    IReadOnlyList<string?>? RecentNids = null);
 
 /// <summary>
 /// Continuation state for a blocked guest thread, replacing the closure pair a blocking

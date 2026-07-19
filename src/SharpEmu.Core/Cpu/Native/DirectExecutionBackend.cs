@@ -455,6 +455,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public string? LastImportNid;
 
+		// [DIAG] recent import NIDs (ring) so the per-thread heartbeat can show
+		// what a stuck thread's loop body actually is.
+		public string?[] RecentNids = new string?[28];
+		public int RecentNidsIndex;
+
 		public ulong LastReturnRip;
 
 		// Busy guest workers overwrite the global recent-import ring. Preserve
@@ -3279,6 +3284,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			var index = 0;
 			foreach (var thread in _guestThreads.Values)
 			{
+				// Reconstruct recent NIDs in chronological order from the ring.
+				string?[] ring = thread.RecentNids;
+				int ridx = thread.RecentNidsIndex;
+				var recent = new List<string?>(ring.Length);
+				for (int k = 0; k < ring.Length; k++)
+				{
+					var n = ring[(ridx + k) % ring.Length];
+					if (n != null) recent.Add(n);
+				}
+
 				snapshots[index++] = new GuestThreadSnapshot(
 					thread.ThreadHandle,
 					thread.Name,
@@ -3286,7 +3301,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					Interlocked.Read(ref thread.ImportCount),
 					Volatile.Read(ref thread.LastImportNid),
 					Volatile.Read(ref thread.LastReturnRip),
-					thread.BlockReason);
+					thread.BlockReason,
+					recent);
 			}
 
 			return snapshots;
