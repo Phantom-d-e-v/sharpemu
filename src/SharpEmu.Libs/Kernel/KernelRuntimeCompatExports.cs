@@ -1191,7 +1191,7 @@ public static class KernelRuntimeCompatExports
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] __stack_chk_fail#{count}: recovering to caller 0x{callerReturn:X16} (PPSA21564 mitigation)");
                 ctx[CpuRegister.Rsp] = rbp + 0x10;
-                ctx[CpuRegister.Rip] = callerReturn;
+                ctx.Rip = callerReturn;
                 ctx[CpuRegister.Rax] = 0;
                 return 0;
             }
