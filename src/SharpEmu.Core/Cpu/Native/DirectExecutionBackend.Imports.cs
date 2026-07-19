@@ -34,6 +34,20 @@ public sealed partial class DirectExecutionBackend
 	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
 	private static long _canaryReturnRecoveries;
 
+	// [DIAG] Wakeup primitives we trace to see if the conductor ever signals
+	// the blocked worker threads. NIDs: cond_signal/broadcast (posix+sce),
+	// sema signal, eventflag set.
+	private static readonly HashSet<string> _wakeNids = new(StringComparer.Ordinal)
+	{
+		"2MOy+rUfuhQ", // pthread_cond_signal
+		"mkx2fVhNMsg", // pthread_cond_broadcast
+		"kDh-NfxgMtE", // scePthreadCondSignal
+		"JGgj7Uvrl+A", // scePthreadCondBroadcast
+		"4czppHBiriw", // sceKernelSignalSema
+		"IOnSvHzqu6A", // sceKernelSetEventFlag
+	};
+	private static long _wakeTraceCount;
+
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 	private int _il2CppExceptionDiagnosticCount;
@@ -1292,6 +1306,18 @@ public sealed partial class DirectExecutionBackend
 			var rnIdx = activeGuestThreadState.RecentNidsIndex;
 			activeGuestThreadState.RecentNids[rnIdx] = importStubEntry.Nid;
 			activeGuestThreadState.RecentNidsIndex = (rnIdx + 1) % activeGuestThreadState.RecentNids.Length;
+
+			// [DIAG] Trace every call to a wakeup primitive (cond signal/broadcast,
+			// sema signal, eventflag set) with the calling guest thread name, so we
+			// can see whether the conductor ever signals the blocked workers.
+			if (_wakeNids.Contains(importStubEntry.Nid))
+			{
+				var wc = Interlocked.Increment(ref _wakeTraceCount);
+				if (wc <= 60)
+				{
+					Console.Error.WriteLine($"[DIAG][WAKE] thread='{activeGuestThreadState.Name}' nid={importStubEntry.Nid} export={export.Name}");
+				}
+			}
 			}
 		if (dispatchIndex % 100000 == 0)
 		{
