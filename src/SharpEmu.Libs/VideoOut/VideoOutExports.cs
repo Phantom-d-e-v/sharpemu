@@ -79,7 +79,7 @@ public static class VideoOutExports
         StringComparison.Ordinal);
     private static long _frameRateWindowStart = Stopwatch.GetTimestamp();
     private static long _submittedFrameCount;
-    private static int _diagnosticFlipCount;
+    private static long _diagnosticFlipCount;
     public static long DiagnosticFlipCount => Interlocked.Read(ref _diagnosticFlipCount);
     private static readonly int _holdFirstFlipMilliseconds =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_HOLD_FIRST_FLIP_MS"), out var holdMs)
