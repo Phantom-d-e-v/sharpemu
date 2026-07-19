@@ -665,6 +665,31 @@ public static class FontExports
         LibraryName = "libSceFont")]
     public static int GetCharImageBuffer2(CpuContext ctx) => SetSuccess(ctx);
 
+    // Renderer/font teardown. Pure release calls the engine makes once
+    // during shutdown/init-cleanup; a success return is correct. Without
+    // them the import traps (Astro Bot calls sceFontUnbindRenderer /
+    // sceFontCloseFont / sceFontDestroyRenderer during boot cleanup).
+    [SysAbiExport(
+        Nid = "1QjhKxrsOB8",
+        ExportName = "sceFontUnbindRenderer",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int UnbindRenderer(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "vzHs3C8lWJk",
+        ExportName = "sceFontCloseFont",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int CloseFont(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "exAxkyVLt0s",
+        ExportName = "sceFontDestroyRenderer",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int DestroyRenderer(CpuContext ctx) => SetSuccess(ctx);
+
     private static int ReturnSelection(CpuContext ctx, ref ulong selectionAddress, uint objectSize)
     {
         if (ctx[CpuRegister.Rdi] != 0)
