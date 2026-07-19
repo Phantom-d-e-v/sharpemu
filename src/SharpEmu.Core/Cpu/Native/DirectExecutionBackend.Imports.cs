@@ -3,6 +3,7 @@
 
 using System;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -47,6 +48,20 @@ public sealed partial class DirectExecutionBackend
 		"IOnSvHzqu6A", // sceKernelSetEventFlag
 	};
 	private static long _wakeTraceCount;
+	private static readonly ConcurrentDictionary<string, int> _wakeCounts = new(StringComparer.Ordinal);
+
+	/// <summary>[DIAG] Cumulative wakeup-primitive call counts (survives tail-scroll).</summary>
+	public static string GetWakeStats()
+	{
+		if (_wakeCounts.IsEmpty)
+		{
+			return "[DIAG][WAKE-STATS] none";
+		}
+
+		var parts = _wakeCounts.OrderByDescending(kv => kv.Value)
+			.Select(kv => $"{kv.Key}={kv.Value}");
+		return "[DIAG][WAKE-STATS] " + string.Join(" ", parts);
+	}
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
@@ -1307,15 +1322,19 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.RecentNids[rnIdx] = importStubEntry.Nid;
 			activeGuestThreadState.RecentNidsIndex = (rnIdx + 1) % activeGuestThreadState.RecentNids.Length;
 
-			// [DIAG] Trace every call to a wakeup primitive (cond signal/broadcast,
-			// sema signal, eventflag set) with the calling guest thread name, so we
-			// can see whether the conductor ever signals the blocked workers.
+			// [DIAG] Trace + tally every call to a wakeup primitive (cond
+			// signal/broadcast, sema signal, eventflag set) with the calling
+			// guest thread name and the target handle, so we can see whether
+			// the conductor ever signals the blocked worker threads. Cumulative
+			// counts survive log tail-scrolling; the per-call line is rate-limited.
 			if (_wakeNids.Contains(importStubEntry.Nid))
 			{
+				var key = $"{importStubEntry.Nid}:{activeGuestThreadState.Name}";
+				_wakeCounts.AddOrUpdate(key, 1, (_, c) => c + 1);
 				var wc = Interlocked.Increment(ref _wakeTraceCount);
-				if (wc <= 60)
+				if (wc <= 80)
 				{
-					Console.Error.WriteLine($"[DIAG][WAKE] thread='{activeGuestThreadState.Name}' nid={importStubEntry.Nid} export={export.Name}");
+					Console.Error.WriteLine($"[DIAG][WAKE] thread='{activeGuestThreadState.Name}' nid={importStubEntry.Nid} export={export.Name} handle=0x{arg0:X16}");
 				}
 			}
 			}

@@ -715,6 +715,7 @@ public static class PadExports
                 {
                     _lastHeartbeat = now;
                     Console.Error.WriteLine($"[DIAG][HEARTBEAT] maxImport={maxImport} threads={snapshots.Count} flips={flips} stall={(now - _lastProgressTime).TotalSeconds:F0}s");
+                    Console.Error.WriteLine(SharpEmu.Core.Cpu.Native.DirectExecutionBackend.GetWakeStats());
                 }
 
                 // Full per-thread table every 15s. This is the real diagnostic:
