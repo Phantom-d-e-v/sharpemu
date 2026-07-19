@@ -550,7 +550,7 @@ public static class PadExports
             r2 = Math.Max(r2, pad.RightTrigger);
         }
 
-        if (IsAutoCrossActive())
+        if (IsAutoCrossHeld())
         {
             buttons |= 0x4000;
         }
@@ -616,6 +616,28 @@ public static class PadExports
         }
 
         return false;
+    }
+
+    // Astro Bot boots to a static splash and blocks until a pad Cross press
+    // arrives. For unattended/headless verification we hold Cross down across
+    // the entire boot window so a single early sample can't be missed, and we
+    // log the first injection so boot.log proves the press was sent.
+    private static bool _autoCrossLogged;
+    private static bool IsAutoCrossHeld()
+    {
+        if (SystemServiceExports.MainAppTitleId != "PPSA21564")
+        {
+            return IsAutoCrossActive();
+        }
+
+        var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
+        var held = elapsed >= 1.5 && elapsed <= 16.0;
+        if (held && !_autoCrossLogged)
+        {
+            _autoCrossLogged = true;
+            Console.Error.WriteLine("[LOADER][INFO] AutoCross: holding Cross 1.5s-16s for Astro Bot splash.");
+        }
+        return held;
     }
 
     /// <summary>Maps the host seam's neutral button flags onto SCE_PAD_BUTTON bits.</summary>
