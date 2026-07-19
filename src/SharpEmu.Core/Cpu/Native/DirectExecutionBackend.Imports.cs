@@ -1289,7 +1289,10 @@ public sealed partial class DirectExecutionBackend
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
-		}
+			var rnIdx = activeGuestThreadState.RecentNidsIndex;
+			activeGuestThreadState.RecentNids[rnIdx] = importStubEntry.Nid;
+			activeGuestThreadState.RecentNidsIndex = (rnIdx + 1) % activeGuestThreadState.RecentNids.Length;
+			}
 		if (dispatchIndex % 100000 == 0)
 		{
 			Console.Error.WriteLine(
