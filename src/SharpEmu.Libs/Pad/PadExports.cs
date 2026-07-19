@@ -742,7 +742,7 @@ public static class PadExports
                         if (!string.Equals(s.State, "Running", StringComparison.OrdinalIgnoreCase) ||
                             !string.IsNullOrEmpty(s.BlockReason))
                         {
-                            Console.Error.WriteLine($"[DIAG][STALL] thread='{s.Name}' state={s.State} imports={s.ImportCount} lastNid={s.LastImportNid} rip=0x{s.LastReturnRip:X16} block={s.BlockReason ?? \"-\"}");
+                            Console.Error.WriteLine($"[DIAG][STALL] thread='{s.Name}' state={s.State} imports={s.ImportCount} lastNid={s.LastImportNid} rip=0x{s.LastReturnRip:X16} block={s.BlockReason ?? "-"}");
                         }
                     }
                 }
