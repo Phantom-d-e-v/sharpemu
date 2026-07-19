@@ -671,6 +671,7 @@ public static class PadExports
     private static DateTime _lastProgressTime = DateTime.UtcNow;
     private static bool _stallReported;
     private static DateTime _lastHeartbeat = DateTime.UtcNow;
+    private static DateTime _lastThreadDump = DateTime.UtcNow;
 
     private static void EnsureStallWatchdog()
     {
@@ -704,41 +705,46 @@ public static class PadExports
                 {
                     _lastMaxImport = maxImport;
                     _lastProgressTime = DateTime.UtcNow;
-                    _stallReported = false;
                 }
 
-                // Heartbeat: prove progress even on the static splash, and
-                // surface any blocked/non-running threads + top importers.
-                if ((DateTime.UtcNow - _lastHeartbeat).TotalSeconds >= 5)
+                var flips = SharpEmu.Libs.VideoOut.VideoOutExports.DiagnosticFlipCount;
+                var now = DateTime.UtcNow;
+
+                // Heartbeat every 5s: alive + flip count.
+                if ((now - _lastHeartbeat).TotalSeconds >= 5)
                 {
-                    _lastHeartbeat = DateTime.UtcNow;
-                    var flips = SharpEmu.Libs.VideoOut.VideoOutExports.DiagnosticFlipCount;
-                    Console.Error.WriteLine($"[DIAG][HEARTBEAT] maxImport={maxImport} threads={snapshots.Count} flips={flips} stall={(DateTime.UtcNow - _lastProgressTime).TotalSeconds:F0}s");
-                    // Top importers (which threads are actually doing work).
-                    var top = snapshots.OrderByDescending(s => s.ImportCount).Take(4).ToArray();
-                    foreach (var s in top)
+                    _lastHeartbeat = now;
+                    Console.Error.WriteLine($"[DIAG][HEARTBEAT] maxImport={maxImport} threads={snapshots.Count} flips={flips} stall={(now - _lastProgressTime).TotalSeconds:F0}s");
+                }
+
+                // Full per-thread table every 15s. This is the real diagnostic:
+                // shows which thread is racing (high imports) vs which is stuck
+                // (low imports / non-Running / has a block reason).
+                if ((now - _lastThreadDump).TotalSeconds >= 15)
+                {
+                    _lastThreadDump = now;
+                    var ordered = snapshots.OrderByDescending(s => s.ImportCount).ToArray();
+                    Console.Error.WriteLine($"[DIAG][THREADS] === thread table (flips={flips}) ===");
+                    foreach (var s in ordered)
                     {
-                        Console.Error.WriteLine($"[DIAG][HB] top thread='{s.Name}' imports={s.ImportCount} lastNid={s.LastImportNid}");
+                        Console.Error.WriteLine($"[DIAG][THREADS] '{s.Name}' imports={s.ImportCount} state={s.State} lastNid={s.LastImportNid ?? "-"} block={s.BlockReason ?? "-"}");
                     }
-                    // Any non-running threads (blocked/waiting) - these are suspects.
+                    Console.Error.WriteLine($"[DIAG][THREADS] === end (maxImport={maxImport}) ===");
+                }
+
+                // Stall: if the GLOBAL max hasn't moved for 15s, dump the blocked ones.
+                if ((now - _lastProgressTime).TotalSeconds >= 15 && !_stallReported)
+                {
+                    _stallReported = true;
+                    Console.Error.WriteLine($"[DIAG][STALL] no import progress for 15s (maxImport={maxImport}). Threads={snapshots.Count}");
                     foreach (var s in snapshots)
                     {
-                        if (!string.Equals(s.State, "Running", StringComparison.OrdinalIgnoreCase))
+                        if (!string.Equals(s.State, "Running", StringComparison.OrdinalIgnoreCase) ||
+                            !string.IsNullOrEmpty(s.BlockReason))
                         {
-                            Console.Error.WriteLine($"[DIAG][HB] BLOCKED thread='{s.Name}' state={s.State} imports={s.ImportCount} lastNid={s.LastImportNid} block={s.BlockReason ?? \"-\"}");
+                            Console.Error.WriteLine($"[DIAG][STALL] thread='{s.Name}' state={s.State} imports={s.ImportCount} lastNid={s.LastImportNid} rip=0x{s.LastReturnRip:X16} block={s.BlockReason ?? \"-\"}");
                         }
                     }
-                }
-
-                if ((DateTime.UtcNow - _lastProgressTime).TotalSeconds < 10 || _stallReported)
-                {
-                    return;
-                }
-                _stallReported = true;
-                Console.Error.WriteLine($"[DIAG][STALL] no import progress for 10s (maxImport={maxImport}). Threads={snapshots.Count}");
-                foreach (var s in snapshots)
-                {
-                    Console.Error.WriteLine($"[DIAG][STALL] thread='{s.Name}' state={s.State} imports={s.ImportCount} lastNid={s.LastImportNid} rip=0x{s.LastReturnRip:X16} block={s.BlockReason ?? "-"}");
                 }
             }
             catch
