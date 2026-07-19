@@ -48,19 +48,6 @@ public static class AstroBotStubs
         }
     }
 
-    // sk54bi6FtYM — called once during audio init, returned 0x80410002.
-    // rdi=0 rsi=0x10000000 rdx=0x17 rcx=struct.
-    [SysAbiExport(
-        Nid = "sk54bi6FtYM",
-        ExportName = "",
-        Target = Generation.Gen5,
-        LibraryName = "libSceAudioOut2")]
-    public static int AstroSk54bi6FtYM(CpuContext ctx)
-    {
-        SafeZero(ctx, ctx[CpuRegister.Rcx], 0x40);
-        return Ok(ctx);
-    }
-
     // dolOmWH+huQ — paired with fd5Bp5tGTgo (~30 calls before freeze).
     // rdi=stack rsi=bufA rdx=bufB rcx=struct r8=bufC r9=size.
     [SysAbiExport(
