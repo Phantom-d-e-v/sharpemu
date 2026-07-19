@@ -676,6 +676,12 @@ public static class AvPlayerExports
             // the intro clip instead of crashing.
             if (player.VideoDeliveryDisabled)
             {
+                // Video delivery is intentionally disabled for this title (the
+                // guest texture allocator is unsafe). Signal end-of-stream so the
+                // game's sceAvPlayerIsActive() poll loop exits and boot advances
+                // past the intro clip instead of busy-waiting on the splash.
+                player.EndOfStream = true;
+                player.PlaybackClock.Stop();
                 return SetReturn(ctx, 0);
             }
 
