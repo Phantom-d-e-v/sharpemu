@@ -1099,6 +1099,18 @@ public static class AvPlayerExports
         {
             return configured;
         }
+
+        // Candidate file names: prefer the executable, but also accept a
+        // wrapper script/batch that some Windows builds ship.
+        string[] names =
+        [
+            "ffmpeg",
+            "ffmpeg.exe",
+            "ffmpeg.bat",
+            "ffmpeg.sh",
+        ];
+
+        // Unix/macOS homebrew locations.
         foreach (var candidate in new[] { "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg" })
         {
             if (File.Exists(candidate))
@@ -1106,6 +1118,65 @@ public static class AvPlayerExports
                 return candidate;
             }
         }
+
+        // Walk every directory on PATH (works on Windows and Linux/macOS).
+        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        var pathSeparator = OperatingSystem.IsWindows() ? ';' : ':';
+        foreach (var dir in pathEnv.Split(pathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            foreach (var name in names)
+            {
+                var candidate = Path.Combine(dir, name);
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        // Common Windows install locations when not on PATH.
+        if (OperatingSystem.IsWindows())
+        {
+            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            var winGetRoot = Path.Combine(localAppData, "Microsoft", "WinGet", "Packages");
+            var extraDirs = new List<string>(capacity: 8);
+            if (!string.IsNullOrEmpty(localAppData)) extraDirs.Add(Path.Combine(localAppData, "ffmpeg", "bin"));
+            if (!string.IsNullOrEmpty(programFiles)) extraDirs.Add(Path.Combine(programFiles, "ffmpeg", "bin"));
+            if (!string.IsNullOrEmpty(programFilesX86)) extraDirs.Add(Path.Combine(programFilesX86, "ffmpeg", "bin"));
+            if (Directory.Exists(winGetRoot))
+            {
+                foreach (var sub in Directory.EnumerateDirectories(winGetRoot, "*ffmpeg*", SearchOption.TopDirectoryOnly))
+                {
+                    extraDirs.Add(Path.Combine(sub, "bin"));
+                }
+            }
+            // Also recurse one level under C:\ffmpeg in case of C:\ffmpeg\bin etc.
+            foreach (var root in new[] { "C:\\ffmpeg", "D:\\ffmpeg" })
+            {
+                if (Directory.Exists(root))
+                {
+                    extraDirs.Add(root);
+                    foreach (var sub in Directory.EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly))
+                    {
+                        extraDirs.Add(sub);
+                    }
+                }
+            }
+            foreach (var dir in extraDirs)
+            {
+                foreach (var name in names)
+                {
+                    var candidate = Path.Combine(dir, name);
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+        }
+
         return null;
     }
 
