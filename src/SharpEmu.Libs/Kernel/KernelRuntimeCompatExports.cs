@@ -1178,15 +1178,18 @@ public static class KernelRuntimeCompatExports
         //     ... <function epilogue> ... ret
         //     call __stack_chk_fail      ; taken on mismatch
         //     ud2                        ; 0F 0B (falls through to next function)
-        // so when we enter here, ctx.Rip == return addr into the `ud2` and
-        // [RSP]   == that ud2 address, [RSP+8] == the function's real caller ret.
+        //
+        // We reach here via the HLE import bridge, so ctx.Rip points at the HLE
+        // trampoline (0x7000...), NOT the guest code. The guest return address
+        // (into the `ud2`) is the value on the guest stack at [RSP]. From it:
+        //   callSite = retAddr - 5   (the `E8` opcode, 5 bytes)
+        //   retSite  = retAddr - 6   (the `C3` ret just before the call)
         //
         // To behave exactly as if the canary had matched, we:
         //   1. NOP the `call __stack_chk_fail` site so this function never trips
         //      again on subsequent calls, and
-        //   2. resume at the function's own `ret` (the C3 just before the call),
-        //      with RSP advanced past the ud2 return so `ret` pops the real
-        //      caller address.
+        //   2. resume at the function's own `ret`, with RSP advanced past the ud2
+        //      return so `ret` pops the real caller address.
         // This is a playable-now mitigation; the overflow itself needs upstream
         // investigation.
         if (string.Equals(
@@ -1194,24 +1197,26 @@ public static class KernelRuntimeCompatExports
                 "PPSA21564",
                 StringComparison.OrdinalIgnoreCase))
         {
-            // ctx.Rip is the return address pushed by `call` => points at `ud2`.
-            // The `call` opcode is 5 bytes (E8 + rel32); the `ret` is 1 byte (C3)
-            // immediately before it.
-            var callSite = ctx.Rip - 5;
-            var retSite  = ctx.Rip - 6;
-
-            // NOP the call site (E8 CC 0D 52 06 -> 90 90 90 90 90).
-            Span<byte> nops = stackalloc byte[5];
-            for (var i = 0; i < 5; i++) nops[i] = 0x90;
-            _ = ctx.Memory.TryWrite(callSite, nops);
-
             var rsp = ctx[CpuRegister.Rsp];
-            Console.Error.WriteLine(
-                $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary mismatch @0x{ctx.Rip:X16} — neutralizing call site 0x{callSite:X16}, resuming at ret 0x{retSite:X16}");
-            ctx.Rip = retSite;                 // execute the function's own `ret`
-            ctx[CpuRegister.Rsp] = rsp + 8;    // skip the ud2 return; `ret` pops caller ret
-            ctx[CpuRegister.Rax] = 0;
-            return 0;
+            if (rsp != 0
+                && ctx.TryReadUInt64(rsp, out var retAddr)   // guest ud2 return addr
+                && (retAddr & 0xFFFFFFFF00000000UL) == 0x0000000800000000UL) // sanity: guest VA
+            {
+                var callSite = retAddr - 5;   // E8 CC 0D 52 06
+                var retSite  = retAddr - 6;   // C3
+
+                // NOP the call site so this function never trips again.
+                Span<byte> nops = stackalloc byte[5];
+                for (var i = 0; i < 5; i++) nops[i] = 0x90;
+                _ = ctx.Memory.TryWrite(callSite, nops);
+
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary mismatch (hle rip=0x{ctx.Rip:X16}) — neutralizing call site 0x{callSite:X16}, resuming at ret 0x{retSite:X16}");
+                ctx.Rip = retSite;              // execute the function's own `ret`
+                ctx[CpuRegister.Rsp] = rsp + 8; // skip ud2 ret; `ret` pops caller ret
+                ctx[CpuRegister.Rax] = 0;
+                return 0;
+            }
         }
 
         Console.Error.WriteLine(
