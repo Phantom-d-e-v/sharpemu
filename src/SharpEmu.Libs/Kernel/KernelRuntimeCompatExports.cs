@@ -65,6 +65,17 @@ public static class KernelRuntimeCompatExports
     private static readonly object _prtApertureGate = new();
     private static readonly (ulong Base, ulong Size)[] _prtApertures = new (ulong Base, ulong Size)[3];
     private static int _stackChkFailCount;
+
+    // Astro Bot (PPSA21564): one of the game's own canary-protected functions
+    // trips __stack_chk_fail during boot due to a genuine game-side stack
+    // overflow that clobbers only the canary slot. The HLE import bridge
+    // restores RIP from its own saved return (the `ud2` after the call), so a
+    // runtime "resume at ret" inside StackCheckFail cannot work. Instead we
+    // neutralize the canary *check* itself: NOP the `jne` (75 15) at the fixed
+    // guest VA 0x800FCB2A8 so the epilogue always falls through to its own
+    // `ret`. Applied once from StackCheckGuard (runs at every canary prologue,
+    // before the trip) for this title.
+    private static bool _astroCanaryCheckNeutralized;
     private static long _usleepTraceCount;
     private static readonly bool _traceUsleep =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal);
@@ -1159,8 +1170,52 @@ public static class KernelRuntimeCompatExports
             _ = ctx.TryWriteUInt64(ctx.FsBase + TlsStackChkGuardBaseOffset + StackChkGuardFieldOffset, _stackChkGuardValue);
         }
 
+        // Astro Bot (PPSA21564): neutralize the offending canary check once,
+        // before this function's body runs, so __stack_chk_fail is never called.
+        if (!_astroCanaryCheckNeutralized
+            && string.Equals(
+                SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId,
+                "PPSA21564",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            NeutralizeAstroBotCanaryCheck();
+        }
+
         ctx[CpuRegister.Rax] = baseAddress;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // NOP the `jne` (75 15) at guest VA 0x800FCB2A8 — the canary comparison's
+    // conditional jump in the function that trips __stack_chk_fail on boot.
+    // Uses the same VirtualProtect(RWX) + FlushInstructionCache sequence the
+    // direct-execution backend uses to patch guest code in place; without the
+    // cache flush the CPU may keep executing the original `ud2` bytes.
+    private static void NeutralizeAstroBotCanaryCheck()
+    {
+        const ulong jneAddress = 0x0000000800FCB2A8uL;
+        try
+        {
+            if (!HostMemory.Protect((void*)jneAddress, 2u, HostMemory.PAGE_EXECUTE_READWRITE, out var oldProtect))
+            {
+                return;
+            }
+            try
+            {
+                Marshal.WriteByte((nint)jneAddress, 0x90);      // 75 -> NOP
+                Marshal.WriteByte((nint)jneAddress + 1, 0x90);  // 15 -> NOP
+                HostMemory.FlushInstructionCache((void*)jneAddress, 2u);
+                _astroCanaryCheckNeutralized = true;
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] PPSA21564 canary check neutralized at 0x{jneAddress:X16} (jne -> nop nop)");
+            }
+            finally
+            {
+                HostMemory.Protect((void*)jneAddress, 2u, oldProtect, out _);
+            }
+        }
+        catch
+        {
+        }
     }
 
     [SysAbiExport(
@@ -1172,51 +1227,22 @@ public static class KernelRuntimeCompatExports
     {
         var count = Interlocked.Increment(ref _stackChkFailCount);
 
-        // Astro Bot (PPSA21564): the game trips a stack canary in one of its own
-        // functions during gameplay init (a genuine game-side stack overflow that
-        // corrupts the frame's canary slot). The compiler layout is:
-        //     ... <function epilogue> ... ret
-        //     call __stack_chk_fail      ; taken on mismatch
-        //     ud2                        ; 0F 0B (falls through to next function)
-        //
-        // We reach here via the HLE import bridge, so ctx.Rip points at the HLE
-        // trampoline (0x7000...), NOT the guest code. The guest return address
-        // (into the `ud2`) is the value on the guest stack at [RSP]. From it:
-        //   callSite = retAddr - 5   (the `E8` opcode, 5 bytes)
-        //   retSite  = retAddr - 6   (the `C3` ret just before the call)
-        //
-        // To behave exactly as if the canary had matched, we:
-        //   1. NOP the `call __stack_chk_fail` site so this function never trips
-        //      again on subsequent calls, and
-        //   2. resume at the function's own `ret`, with RSP advanced past the ud2
-        //      return so `ret` pops the real caller address.
-        // This is a playable-now mitigation; the overflow itself needs upstream
-        // investigation.
+        // Astro Bot (PPSA21564): the canary check is neutralized at load
+        // (see NeutralizeAstroBotCanaryCheck, called from StackCheckGuard) so
+        // __stack_chk_fail is normally never reached. If it IS reached — e.g. a
+        // different canary-protected function overflows — the HLE import bridge
+        // would otherwise resume execution at the function's `ud2` (0F 0B) and
+        // fault. The safe action is a clean exit of the current guest thread
+        // rather than returning into the trap.
         if (string.Equals(
                 SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId,
                 "PPSA21564",
                 StringComparison.OrdinalIgnoreCase))
         {
-            var rsp = ctx[CpuRegister.Rsp];
-            if (rsp != 0
-                && ctx.TryReadUInt64(rsp, out var retAddr)   // guest ud2 return addr
-                && (retAddr & 0xFFFFFFFF00000000UL) == 0x0000000800000000UL) // sanity: guest VA
-            {
-                var callSite = retAddr - 5;   // E8 CC 0D 52 06
-                var retSite  = retAddr - 6;   // C3
-
-                // NOP the call site so this function never trips again.
-                Span<byte> nops = stackalloc byte[5];
-                for (var i = 0; i < 5; i++) nops[i] = 0x90;
-                _ = ctx.Memory.TryWrite(callSite, nops);
-
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary mismatch (hle rip=0x{ctx.Rip:X16}) — neutralizing call site 0x{callSite:X16}, resuming at ret 0x{retSite:X16}");
-                ctx.Rip = retSite;              // execute the function's own `ret`
-                ctx[CpuRegister.Rsp] = rsp + 8; // skip ud2 ret; `ret` pops caller ret
-                ctx[CpuRegister.Rax] = 0;
-                return 0;
-            }
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip (unexpected — check was meant to be neutralized). Cleanly exiting guest thread.");
+            GuestThreadExecution.RequestCurrentEntryExit("__stack_chk_fail", 0);
+            return 0;
         }
 
         Console.Error.WriteLine(
