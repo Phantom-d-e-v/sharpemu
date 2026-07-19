@@ -21,6 +21,7 @@ public static class AudioOut2Exports
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
     private static long _pushTraceCount;
+    private static long _queueTraceCount;
 
     // Per-context audio parameters captured at ContextCreate so ContextAdvance
     // can pace to the real playback cadence (grain samples at the sample rate).
@@ -41,6 +42,10 @@ public static class AudioOut2Exports
         public uint Frequency { get; }
         public uint Channels { get; }
         public uint GrainSamples { get; }
+        // Virtual queue level (in samples) so games that wait on a non-empty
+        // audio queue before signalling their render threads actually proceed.
+        // Push adds a grain; Advance removes one. Clamped at zero.
+        public long QueueLevelSamples { get; set; }
 
         // Blocks the advancing thread until one grain worth of wall-clock time
         // has elapsed since the previous advance, matching hardware timing so
@@ -211,6 +216,7 @@ public static class AudioOut2Exports
             // and does not call ContextAdvance. Pace pushes to one hardware
             // grain so the feeder cannot outrun playback and starve the game.
             context.PaceAdvance();
+            context.QueueLevelSamples += context.GrainSamples;
         }
 
         return SetReturn(ctx, 0);
@@ -228,6 +234,7 @@ public static class AudioOut2Exports
         if (Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context))
         {
             context.PaceAdvance();
+            context.QueueLevelSamples = Math.Max(0, context.QueueLevelSamples - context.GrainSamples);
         }
 
         return SetReturn(ctx, 0);
@@ -240,11 +247,22 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
     {
-        // The advance path paces synchronously, so the queue is always drained.
         var levelAddress = ctx[CpuRegister.Rsi];
+        long level = 0;
+        if (Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context))
+        {
+            level = context.QueueLevelSamples;
+        }
         if (levelAddress != 0)
         {
-            _ = TryWriteUInt64(ctx, levelAddress, 0);
+            _ = TryWriteUInt64(ctx, levelAddress, (ulong)level);
+        }
+
+        // [DIAG] confirm the audio main thread's sync loop sees a non-empty queue.
+        var tc = Interlocked.Increment(ref _queueTraceCount);
+        if (tc <= 40)
+        {
+            Console.Error.WriteLine($"[AUDIOOUT2][DIAG] GetQueueLevel handle=0x{ctx[CpuRegister.Rdi]:X} level={level}");
         }
 
         return SetReturn(ctx, 0);
