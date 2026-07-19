@@ -50,6 +50,25 @@ public sealed partial class DirectExecutionBackend
 	private static long _wakeTraceCount;
 	private static readonly ConcurrentDictionary<string, int> _wakeCounts = new(StringComparer.Ordinal);
 
+	// [DIAG] Self-contained timer (lives in Core, no cross-assembly ref needed)
+	// that periodically prints cumulative wakeup stats so they survive log
+	// tail-scrolling. Started lazily on first import.
+	private static Timer? _wakeStatsTimer;
+	private static int _wakeStatsTimerStarted;
+
+	private static void EnsureWakeStatsTimer()
+	{
+		if (Interlocked.Exchange(ref _wakeStatsTimerStarted, 1) == 1)
+		{
+			return;
+		}
+
+		_wakeStatsTimer = new Timer(_ =>
+		{
+			try { Console.Error.WriteLine(GetWakeStats()); } catch { /* ignore */ }
+		}, null, 5000, 5000);
+	}
+
 	/// <summary>[DIAG] Cumulative wakeup-primitive call counts (survives tail-scroll).</summary>
 	public static string GetWakeStats()
 	{
@@ -1324,6 +1343,7 @@ public sealed partial class DirectExecutionBackend
 			// guest thread name and the target handle, so we can see whether
 			// the conductor ever signals the blocked worker threads. Cumulative
 			// counts survive log tail-scrolling; the per-call line is rate-limited.
+			EnsureWakeStatsTimer();
 			if (_wakeNids.Contains(importStubEntry.Nid))
 			{
 				var key = $"{importStubEntry.Nid}:{activeGuestThreadState.Name}";
