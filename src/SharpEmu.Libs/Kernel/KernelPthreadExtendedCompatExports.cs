@@ -1600,8 +1600,13 @@ public static class KernelPthreadExtendedCompatExports
             return true;
         }
 
-        return rwlock.WaitingWriters > 0 &&
-               rwlock.GetReaderCount(currentThreadId) == 0;
+        // NOTE: previously this also made a reader wait when WaitingWriters > 0 (strict
+        // writer-preference). That starves readers indefinitely on Astro Bot (PPSA21564):
+        // a pending writer blocks the main thread's read lock forever while the writer
+        // itself waits behind an existing reader, deadlocking boot on the splash screen.
+        // Real Orbis read-lock semantics let a reader proceed unless a writer is ACTIVELY
+        // holding the lock. Drop the WaitingWriters gate so readers don't starve.
+        return false;
     }
 
     private static string GetRwlockWakeKey(ulong rwlockAddress) => $"pthread_rwlock:0x{rwlockAddress:X16}";
