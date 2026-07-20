@@ -273,55 +273,29 @@ public sealed partial class DirectExecutionBackend
 		// normally from the HLE export would execute that UD2; redirect this one
 		// well-known compiler epilogue back through its register/stack unwind.
 		// Keep the byte-pattern check strict so the opt-in cannot guess at an
-		// unrelated function layout.
+		// Stack-check (__stack_chk_fail) recovery. On PPSA21564 (Astro Bot)
+		// the canary trip is a false positive from emulator stack-layout
+		// differences, not a real overflow. Redirect the epilogue back through
+		// its normal cleanup so the (often conductor/main) thread keeps running.
+		// Upstream's pattern (cmp rsp,imm8 + jne rel32, resume at num7-20) does
+		// NOT match this game's function; Astro Bot's layout at the return site
+		// is:
+		//   48 3B 45 D0     cmp ...
+		//   75 15           jne FAIL
+		//   48 89 F8        mov rax,rdi   <- cleanup start (num7 + 6)
+		//   48 81 C4 48 1E 00 00  add rsp,0x1E48 ; ... ; C3 ret ; E8 ; 0F 0B
+		// So when the body matches, resume at num7 + 6.
 		if (string.Equals(importStubEntry.Nid, "Ou3iL1abvng", StringComparison.Ordinal) &&
-			string.Equals(
-				Environment.GetEnvironmentVariable("SHARPEMU_IGNORE_STACK_CHK"),
-				"1",
-				StringComparison.Ordinal) &&
-			num7 >= 0x20)
-		{
-			var returnCode = (byte*)num7;
-			if (returnCode[0] == 0x0F && returnCode[1] == 0x0B &&
-				returnCode[-22] == 0x75 && returnCode[-21] == 0x0F &&
-				returnCode[-20] == 0x48 && returnCode[-19] == 0x83 &&
-				returnCode[-18] == 0xC4)
-			{
-				var recoveredReturn = num7 - 20;
-				*(ulong*)(argPackPtr + 96) = recoveredReturn;
-				cpuContext[CpuRegister.Rax] = 0;
-				Console.Error.WriteLine(
-					$" [LOADER][WARN] Recovered guest stack-check epilogue " +
-					$"ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
-				return 0;
-			}
-			}
-			// Astro Bot (PPSA21564) specific recovery. The upstream pattern
-			// above assumes a different compiler layout (cmp rsp,imm8 + jne
-			// rel32) and does NOT match this game's canary function, whose
-			// layout is:
-			//   48 3B 45 D0     cmp ...
-			//   75 15           jne FAIL
-			//   48 89 F8        mov rax,rdi   <- cleanup start (num7 + 6)
-			//   48 81 C4 48 1E 00 00  add rsp,0x1E48
-			//   5B 41 5C ... C3 ret
-			//   E8 ... 0F 0B    FAIL: call __stack_chk_fail ; ud2
-			// The return address num7 points at the `cmp` (0x800FCB2C4), so the
-			// cleanup epilogue begins at num7 + 6. Resume there so the function
-			// returns cleanly and the conductor thread keeps driving frames.
-			// Gated on PPSA21564 (and SHARPEMU_IGNORE_STACK_CHK=1) so other
-			// titles are unaffected.
-			if (string.Equals(importStubEntry.Nid, "Ou3iL1abvng", StringComparison.Ordinal) &&
-			(num7 >= 0x40) &&
+			num7 >= 0x20 &&
 			(string.Equals(
 				Environment.GetEnvironmentVariable("SHARPEMU_IGNORE_STACK_CHK"),
 				"1", StringComparison.Ordinal) ||
 			 string.Equals(
 				SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId,
 				"PPSA21564", StringComparison.OrdinalIgnoreCase)))
-			{
+		{
 			var rc = (byte*)num7;
-			// cmp [rsp-based] ; jne rel8 ; mov rax,rdi
+			// Astro Bot: cmp [rsp-based] ; jne rel8 ; mov rax,rdi
 			if (rc[0] == 0x48 && rc[1] == 0x3B && rc[2] == 0x45 &&
 				rc[4] == 0x75 && rc[6] == 0x48 && rc[7] == 0x89 && rc[8] == 0xF8)
 			{
@@ -332,8 +306,20 @@ public sealed partial class DirectExecutionBackend
 					$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564) ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
 				return 0;
 			}
+			// Upstream general pattern: ud2 ; jne rel32 ; cmp rsp,imm8 ; resume num7-20
+			if (rc[0] == 0x0F && rc[1] == 0x0B &&
+				((byte*)num7)[-22] == 0x75 && ((byte*)num7)[-21] == 0x0F &&
+				((byte*)num7)[-20] == 0x48 && ((byte*)num7)[-19] == 0x83 &&
+				((byte*)num7)[-18] == 0xC4)
+			{
+				var recoveredReturn = num7 - 20;
+				*(ulong*)(argPackPtr + 96) = recoveredReturn;
+				cpuContext[CpuRegister.Rax] = 0;
+				Console.Error.WriteLine(
+					$" [LOADER][WARN] Recovered guest stack-check epilogue ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
+				return 0;
 			}
-			}
+		}
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
