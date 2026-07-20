@@ -1272,33 +1272,30 @@ public static class KernelRuntimeCompatExports
             {
                 if (ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var retAddr))
                 {
-                    // Astro Bot's canary-protected function (the one at
-                    // 0x800FCB2C4) has this layout:
-                    //   0x...2C4: 48 3B 45 D0        cmp rbp, rsp
-                    //   0x...2C8: 75 15              jne <fail>   (neutralized -> nop nop)
-                    //   0x...2CA: 48 89 F8           mov rax, rdi
-                    //   0x...2CD: 48 81 C4 48 1E..   add rsp, 0x1E48
-                    //   0x...2D4: 5B 41 5C ...       pop registers
-                    //   0x...2DE: C3                 ret
-                    //   0x...2DF: E8 ....            call __stack_chk_fail (ud2 cold path)
-                    //
-                    // The HLE import bridge invokes this export with [RSP] already
-                    // set to 0x800FCB2C4 — the function's canary-check site — and
-                    // resumes guest execution at whatever [RSP] holds when we
-                    // return. The canary `jne` is neutralized, so re-running from
-                    // 0x800FCB2C4 simply falls through the (now no-op) cmp, runs
-                    // `mov rax,rdi`, tears down the frame, and `ret`s cleanly to
-                    // the caller. That is exactly the recovery we want, so we do
-                    // NOT rewrite [RSP]; we only pre-set RAX = RDI (the value the
-                    // epilogue will return) and return 0, letting the bridge
-                    // resume the function at 0x800FCB2C4.
-                    //
-                    // Writing any OTHER address into [RSP] (retAddr-0x14, +6, or
-                    // the `ret`) either lands mid-instruction (0xC000001D) or
-                    // strikes an int3/breakpoint trap (0x80000003) in the
-                    // direct-execution backend, because that page is not
-                    // authorized for re-entry at those offsets. Resuming at the
-                    // bridge-provided 0x800FCB2C4 is the only safe path.
+                    // DIAGNOSTIC (PPSA21564): dump 0x100 bytes immediately
+                    // BEFORE the ud2 cold-path (retAddr) so we can read the real
+                    // epilogue (mov rax,rdi / add rsp / pop* / ret) and compute
+                    // the exact resume offset. retAddr (0x800FCB2C4) is the ud2,
+                    // NOT the function head; the real epilogue precedes it.
+                    var diag = new System.Text.StringBuilder();
+                    diag.Append($"[LOADER][DIAG] __stack_chk_fail pre-ud2 @0x{retAddr - 0x100uL:X16}: ");
+                    for (var i = 0; i < 0x100; i++)
+                    {
+                        if (ctx.TryReadUInt8(retAddr - 0x100uL + (ulong)i, out var b))
+                            diag.Append($"{b:X2} ");
+                        else
+                            diag.Append("?? ");
+                    }
+                    Console.Error.WriteLine(diag.ToString());
+
+                    // Astro Bot's canary-protected function: retAddr (0x800FCB2C4)
+                    // is the ud2 cold path that follows `call __stack_chk_fail`.
+                    // The real function body (cmp rbp,rsp; jne; mov rax,rdi;
+                    // add rsp,imm; pop*; ret) precedes it. We must resume at the
+                    // epilogue's first instruction (the `mov rax,rdi`/teardown),
+                    // NOT at the ud2. The exact offset is derived from the dumped
+                    // bytes above. For now we set RAX=RDI and return; the resume
+                    // offset is patched once the layout is confirmed.
                     ctx[CpuRegister.Rax] = ctx[CpuRegister.Rdi];
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip recovered (resumed at 0x{retAddr:X16}).");
