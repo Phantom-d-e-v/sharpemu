@@ -3025,12 +3025,11 @@ internal static unsafe class VulkanVideoPresenter
         private Fence _guestReadbackFence;
         private int _directPresentationCount;
         private bool _loggedPresentRoute;
-        // Cached A2B10→BGRA convert for the last flip version. Re-converting a
-        // full 4K packed10 buffer every present was a multi-second stall once
-        // QueueWaitIdle was removed; identical flip versions can reuse this.
-        private ulong _cachedPackedPresentAddress;
-        private long _cachedPackedPresentFlipVersion;
-        private byte[]? _cachedPackedPresentBgra;
+        // Cached A2B10→BGRA converts keyed by guest address + content-write
+        // timeline (flip snapshots freeze source.LastWriteTimeline into
+        // ContentWriteTimeline so flip-copy fence stamps do not bust the cache).
+        private readonly Dictionary<(ulong Address, ulong ContentTimeline), byte[]>
+            _cachedPackedPresentBgraByImage = new();
         private readonly Dictionary<ulong, long> _presentedGuestImageTraceCounts = new();
         private readonly Dictionary<ulong, GuestImageResource> _guestImages = new();
         private readonly record struct GuestImageVariantKey(
@@ -3328,6 +3327,11 @@ internal static unsafe class VulkanVideoPresenter
             public bool SupportsStorageUsage;
             public ImageLayout Layout = ImageLayout.Undefined;
             public ulong LastWriteTimeline;
+            // Frozen at flip-snapshot creation from the source RT's last draw
+            // timeline. Flip copies bump LastWriteTimeline every present, so
+            // BGRA cache keys must use this (not LastWriteTimeline) or they
+            // miss forever and re-run the multi-second packed10 convert.
+            public ulong ContentWriteTimeline;
         }
 
         private sealed record PendingGuestSubmission(
@@ -5800,6 +5804,7 @@ internal static unsafe class VulkanVideoPresenter
                 Format = source.Format,
                 Image = image,
                 Memory = memory,
+                ContentWriteTimeline = source.LastWriteTimeline,
             };
         }
 
@@ -13246,13 +13251,25 @@ internal static unsafe class VulkanVideoPresenter
                     !_forceGpuPackedPresent &&
                     NeedsCpuPackedPresent(presentedGuestImage.Format))
                 {
-                    FlushBatchedGuestCommands();
-                    WaitForGuestImageLastWrite(presentedGuestImage);
-                    WaitAllFrameSlots();
-                    if (!_deviceLost &&
-                        TryGetOrConvertPackedPresentBgra(
+                    // Cache hit: skip fence waits and the full-frame readback.
+                    if (!TryGetCachedPackedPresentBgra(
                             presentedGuestImage,
                             out var readbackPixels))
+                    {
+                        FlushBatchedGuestCommands();
+                        WaitForGuestImageLastWrite(presentedGuestImage);
+                        // Do not WaitAllFrameSlots here — that only protects
+                        // the shared present staging buffer (below). Guest
+                        // readback uses its own fence/buffer.
+                        if (!_deviceLost)
+                        {
+                            TryGetOrConvertPackedPresentBgra(
+                                presentedGuestImage,
+                                out readbackPixels);
+                        }
+                    }
+
+                    if (readbackPixels is { Length: > 0 })
                     {
                         pixels = presentedGuestImage.Width == _extent.Width &&
                                  presentedGuestImage.Height == _extent.Height
@@ -16084,15 +16101,36 @@ internal static unsafe class VulkanVideoPresenter
                 source is Format.A2B10G10R10UnormPack32 or
                     Format.A2R10G10B10UnormPack32);
 
+        private static (ulong Address, ulong ContentTimeline) PackedPresentCacheKey(
+            GuestImageResource image) =>
+            (image.Address,
+                image.ContentWriteTimeline != 0
+                    ? image.ContentWriteTimeline
+                    : image.LastWriteTimeline);
+
+        private bool TryGetCachedPackedPresentBgra(
+            GuestImageResource image,
+            out byte[] pixels)
+        {
+            if (_cachedPackedPresentBgraByImage.TryGetValue(
+                    PackedPresentCacheKey(image),
+                    out var cached) &&
+                cached.Length > 0)
+            {
+                pixels = cached;
+                return true;
+            }
+
+            pixels = Array.Empty<byte>();
+            return false;
+        }
+
         private bool TryGetOrConvertPackedPresentBgra(
             GuestImageResource image,
             out byte[] pixels)
         {
-            if (_cachedPackedPresentBgra is not null &&
-                _cachedPackedPresentAddress == image.Address &&
-                _cachedPackedPresentFlipVersion == image.FlipVersion)
+            if (TryGetCachedPackedPresentBgra(image, out pixels))
             {
-                pixels = _cachedPackedPresentBgra;
                 return true;
             }
 
@@ -16101,9 +16139,17 @@ internal static unsafe class VulkanVideoPresenter
                 return false;
             }
 
-            _cachedPackedPresentAddress = image.Address;
-            _cachedPackedPresentFlipVersion = image.FlipVersion;
-            _cachedPackedPresentBgra = pixels;
+            _cachedPackedPresentBgraByImage[PackedPresentCacheKey(image)] = pixels;
+
+            // Bound growth: Astro Bot double-buffers, a few RT variants is enough.
+            if (_cachedPackedPresentBgraByImage.Count > 8)
+            {
+                foreach (var stale in _cachedPackedPresentBgraByImage.Keys.Take(4).ToArray())
+                {
+                    _cachedPackedPresentBgraByImage.Remove(stale);
+                }
+            }
+
             return true;
         }
 
