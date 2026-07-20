@@ -3347,10 +3347,23 @@ public static partial class AgcExports
                         length,
                         op,
                         out var dispatch,
-                        out _))
+                        out var indirectDimsRetryAddress))
                 {
                     state.FrameDispatchCount++;
                     ObserveComputeDispatch(ctx, gpuState, state, dispatch);
+                }
+                else if (indirectDimsRetryAddress != 0 &&
+                         HandleSubmittedIndirectDimsWait(
+                             ctx,
+                             state,
+                             commandAddress,
+                             currentAddress,
+                             offset,
+                             dwordCount,
+                             indirectDimsRetryAddress,
+                             tracePackets))
+                {
+                    return true;
                 }
             }
 
@@ -5416,10 +5429,42 @@ public static partial class AgcExports
                     return false;
                 }
 
-                return TryReadUInt32(
-                    ctx,
-                    state.IndirectArgsAddress + dataOffset,
-                    out drawCount);
+                var argumentsAddress = state.IndirectArgsAddress + dataOffset;
+                if (!TryReadUInt32(ctx, argumentsAddress, out drawCount))
+                {
+                    return false;
+                }
+
+                if (_traceAgcShader &&
+                    TryReadUInt32(ctx, argumentsAddress + 4, out var argument1) &&
+                    TryReadUInt32(ctx, argumentsAddress + 8, out var argument2) &&
+                    TryReadUInt32(ctx, argumentsAddress + 12, out var argument3) &&
+                    TryReadUInt32(ctx, argumentsAddress + 16, out var argument4))
+                {
+                    TraceAgcShader(
+                        $"agc.draw_indirect_args op=0x{op:X2} " +
+                        $"addr=0x{argumentsAddress:X16} " +
+                        $"raw={drawCount:X8}/{argument1:X8}/{argument2:X8}/" +
+                        $"{argument3:X8}/{argument4:X8}");
+                }
+
+                // DRAW(_INDEX)_INDIRECT stores the per-draw instance count in
+                // the second argument dword. Keeping the previous NUM_INSTANCES
+                // register value collapses GPU-generated instanced draws to one
+                // instance (Astro Bot emits indexCount=1, instanceCount=512).
+                if (TryReadUInt32(ctx, argumentsAddress + 4, out var indirectInstanceCount))
+                {
+                    state.InstanceCount = indirectInstanceCount;
+                }
+
+                // Indexed indirect arguments place firstIndex in dword 2.
+                if (op == ItDrawIndexIndirect &&
+                    TryReadUInt32(ctx, argumentsAddress + 8, out var firstIndex))
+                {
+                    state.DrawIndexOffset = firstIndex;
+                }
+
+                return true;
             default:
                 return false;
         }

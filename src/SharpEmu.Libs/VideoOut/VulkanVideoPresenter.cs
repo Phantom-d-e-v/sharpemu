@@ -101,6 +101,15 @@ internal readonly record struct VulkanGuestQueueIdentity(
 
 internal static unsafe class VulkanVideoPresenter
 {
+    // Guest render targets can be sampled by any translated graphics or
+    // compute stage. A color-write dependency that publishes only to the
+    // fragment stage leaves an immediate compute consumer without memory
+    // visibility even though queue submission order is preserved.
+    internal const PipelineStageFlags GuestImageShaderReadStages =
+        PipelineStageFlags.VertexShaderBit |
+        PipelineStageFlags.FragmentShaderBit |
+        PipelineStageFlags.ComputeShaderBit;
+
     // Standalone CLI launches use a desktop-sized surface. The embedded GUI
     // always takes its dimensions from the native child control instead.
     private const uint DefaultWindowWidth = 1920;
@@ -10806,7 +10815,7 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
                     PipelineStageFlags.ColorAttachmentOutputBit,
-                    PipelineStageFlags.FragmentShaderBit,
+                    GuestImageShaderReadStages,
                     0,
                     0,
                     null,
