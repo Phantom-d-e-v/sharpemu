@@ -80,7 +80,11 @@ public static class Gen5ShaderTranslator
     public static bool IsScalarConsumed(ulong[] mask, uint register) =>
         register < 256 && (mask[register >> 6] & (1UL << (int)(register & 63))) != 0;
 
-    private const int MaxInstructions = 4096;
+    // Large generated shaders (notably Astro Bot's compute passes) can exceed
+    // 4K instructions. Memory reads and S_ENDPGM remain the primary bounds;
+    // this generous ceiling only protects against walking indefinitely through
+    // valid mapped memory when a malformed program has no terminator.
+    private const int MaxInstructions = 262144;
     private const uint PsUserDataRegister = 0x0C;
     private const uint VsUserDataRegister = 0x4C;
     private const uint GsUserDataRegister = 0x8C;
@@ -422,7 +426,8 @@ public static class Gen5ShaderTranslator
 
         var instructions = new List<Gen5ShaderInstruction>();
         var instructionCount = 0;
-        for (uint pc = 0; instructionCount < MaxInstructions;)
+        uint pc = 0;
+        for (; instructionCount < MaxInstructions;)
         {
             if (!TryReadUInt32(ctx, address + pc, out var word))
             {
@@ -465,7 +470,7 @@ public static class Gen5ShaderTranslator
             }
         }
 
-        error = "unterminated";
+        error = $"unterminated pc=0x{pc:X} instructions={instructionCount}";
         return false;
     }
 
