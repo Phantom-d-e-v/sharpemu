@@ -29,6 +29,39 @@ public static class AvPlayerExports
         var title = SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId;
         return string.Equals(title, "PPSA21564", StringComparison.OrdinalIgnoreCase);
     }
+
+    public static bool IsFallbackVideoBufferAddress(ulong address, out int bufferIndex, out int width, out int height, out ulong bufferBase, out int size)
+    {
+        lock (StateGate)
+        {
+            foreach (var player in Players.Values)
+            {
+                if (player.TextureAllocatorFailed)
+                {
+                    for (int i = 0; i < player.GuestBuffers.Length; i++)
+                    {
+                        var start = player.GuestBuffers[i];
+                        var sizeBytes = (ulong)player.GuestBufferStride;
+                        if (start != 0 && address >= start && address < start + sizeBytes)
+                        {
+                            bufferIndex = i;
+                            width = player.Width;
+                            height = player.Height;
+                            bufferBase = start;
+                            size = player.GuestBufferStride;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        bufferIndex = -1;
+        width = 0;
+        height = 0;
+        bufferBase = 0;
+        size = 0;
+        return false;
+    }
     private static readonly Dictionary<ulong, PlayerState> Players = new();
     private static int _traceCount;
 
@@ -1033,7 +1066,9 @@ public static class AvPlayerExports
         }
         for (var index = 0; index < player.GuestBuffers.Length; index++)
         {
-            player.GuestBuffers[index] = bufferBase + checked((ulong)(index * bufferSize));
+            var buffer = bufferBase + checked((ulong)(index * bufferSize));
+            player.GuestBuffers[index] = buffer;
+            Console.Error.WriteLine($"[AVPLAYER][INFO] fallback_texture_buffer index={index} data=0x{buffer:X16} size={bufferSize}");
         }
         Console.Error.WriteLine("[AVPLAYER][WARN] Guest texture allocator unavailable; using generic HLE memory.");
         return true;

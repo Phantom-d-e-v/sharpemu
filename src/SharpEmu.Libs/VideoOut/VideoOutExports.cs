@@ -50,8 +50,8 @@ public static class VideoOutExports
     // packed 10:10:10:2 and must not be mistaken for an 8-bit RGBA format.
     private const ulong SceVideoOutPixelFormat2R8G8B8A8Srgb = 0x8000000022000000;
     private const ulong SceVideoOutPixelFormat2B8G8R8A8Srgb = 0x8000000000000000;
-    private const ulong SceVideoOutPixelFormat2R10G10B10A2 = 0x8100000622000000;
-    private const ulong SceVideoOutPixelFormat2B10G10R10A2 = 0x8100000600000000;
+    internal const ulong SceVideoOutPixelFormat2R10G10B10A2 = 0x8100000622000000;
+    internal const ulong SceVideoOutPixelFormat2B10G10R10A2 = 0x8100000600000000;
     private const ulong SceVideoOutPixelFormat2R10G10B10A2Srgb = 0x8100000022000000;
     private const ulong SceVideoOutPixelFormat2B10G10R10A2Srgb = 0x8100000000000000;
     private const ulong SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq = 0x8100070422000000;

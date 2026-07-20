@@ -147,6 +147,12 @@ public static partial class AgcExports
     private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType1D = 8;
     private const uint Gen5TextureType2D = 9;
+    private const uint Gen5TextureType3D = 10;
+    private const uint Gen5TextureTypeCube = 11;
+    private const uint Gen5TextureType1DArray = 12;
+    private const uint Gen5TextureType2DArray = 13;
+    private const uint Gen5TextureType2DMsaa = 14;
+    private const uint Gen5TextureType2DMsaaArray = 15;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
@@ -6488,8 +6494,7 @@ public static partial class AgcExports
                     return false;
                 }
 
-                texture = new TextureDescriptor(
-                    0, 1, 1, Gen5TextureFormatR8G8B8A8Unorm, 0, 0, 0, 0, 0, 1, 0xFAC);
+                texture = CreateFallbackTextureDescriptor(binding.ResourceDescriptor);
             }
 
             var isStorage = Gen5ShaderTranslator.RequiresStorageImage(
@@ -8030,8 +8035,11 @@ public static partial class AgcExports
         out GuestDrawTexture texture)
     {
         texture = default!;
-        if ((descriptor.Type != Gen5TextureType1D &&
-             descriptor.Type != Gen5TextureType2D) ||
+        // RDNA resource types 10–15 are 3D / cube / array / MSAA. Astro Bot
+        // binds these for UI and post textures; rejecting them produced 1x1
+        // black FALLBACKs (DRAW shows 0x0:1x1) and wiped sampled content.
+        // Sample as 2D (layer/slice 0) until layered views exist.
+        if (!IsSampleableTextureType(descriptor.Type) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||
@@ -8581,6 +8589,16 @@ public static partial class AgcExports
         {
         }
     }
+
+    private static bool IsSampleableTextureType(uint type) =>
+        type is Gen5TextureType1D
+            or Gen5TextureType2D
+            or Gen5TextureType3D
+            or Gen5TextureTypeCube
+            or Gen5TextureType1DArray
+            or Gen5TextureType2DArray
+            or Gen5TextureType2DMsaa
+            or Gen5TextureType2DMsaaArray;
 
     private static GuestDrawTexture CreateFallbackGuestDrawTexture(
         bool isStorage,
@@ -10250,6 +10268,14 @@ public static partial class AgcExports
             metadataAddress,
             descriptorFlags,
             hasExtendedDescriptor);
+
+        if (address != 0 && SharpEmu.Libs.AvPlayer.AvPlayerExports.IsFallbackVideoBufferAddress(address, out var bufIndex, out var w, out var h, out var bufBase, out var size))
+        {
+            Console.Error.WriteLine(
+                $"[TRACE-YUV-DESC] Intersected fallback video buffer index={bufIndex} base=0x{bufBase:X16} size={size} | " +
+                $"Decoded desc: addr=0x{address:X16} {width}x{height} pitch={pitch} fmt={format} type={type} num={numberType} tile={tileMode}");
+        }
+
         return true;
     }
 
@@ -10258,8 +10284,17 @@ public static partial class AgcExports
         var format = Gen5TextureFormatR8G8B8A8Unorm;
         var numberType = 0u;
         var tileMode = 0u;
+        var address = 0UL;
+        var width = 1;
+        var height = 1;
+        
         if (fields.Count >= 4)
         {
+            // Extract address even if decode fails - might resolve to existing RT
+            address = (((ulong)(fields[1] & 0xFFu) << 32) | fields[0]) << 8;
+            width = Math.Max(1, (int)((((fields[1] >> 30) & 0x3u) | ((fields[2] & 0x3FFFu) << 2)) + 1));
+            height = Math.Max(1, (int)(((fields[2] >> 14) & 0xFFFFu) + 1));
+            
             var unifiedFormat = (fields[1] >> 20) & 0x1FFu;
             if (!Gfx10UnifiedFormat.TryDecode(
                     unifiedFormat,
@@ -10277,16 +10312,16 @@ public static partial class AgcExports
         }
 
         return new TextureDescriptor(
-            Address: 0,
-            Width: 1,
-            Height: 1,
+            Address: address,
+            Width: (uint)width,
+            Height: (uint)height,
             Format: format,
             NumberType: numberType,
             TileMode: tileMode,
             Type: Gen5TextureType2D,
             BaseLevel: 0,
             LastLevel: 0,
-            Pitch: 1,
+            Pitch: (uint)Math.Max(1, width),
             DstSelect: 0xFAC);
     }
 
