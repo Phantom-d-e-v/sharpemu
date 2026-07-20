@@ -58,6 +58,11 @@ internal static partial class Program
 
     private static int Run(string[] args)
     {
+        // BUILD-ID BANNER: proves which commit is actually executing.
+        // If you do NOT see this exact line at the top of boot.log, you are
+        // running a stale/cached binary, not this build.
+        Console.Error.WriteLine("[SHARPEMU-BUILD] branch=fix/graphics-textures-v2 commit=28e37fa CANARY=PPSA21564-num7+6");
+        Console.Error.Flush();
         if (Updater.TryApply(args, out var updateExitCode))
         {
             return updateExitCode;
