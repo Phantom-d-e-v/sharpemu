@@ -323,6 +323,8 @@ public sealed partial class DirectExecutionBackend
 					return false;
 				}
 				// Locate the ud2 (0F 0B) within a small window around num7.
+				// num7 is the return address pushed by the `call __stack_chk_fail`,
+				// so it points AT the ud2 (or just past it).
 				ulong ud2Addr = 0;
 				for (ulong off = 0; off <= 32; off++)
 				{
@@ -334,49 +336,79 @@ public sealed partial class DirectExecutionBackend
 						break;
 					}
 				}
-				if (ud2Addr != 0)
+				if (ud2Addr == 0) ud2Addr = num7; // num7 itself is the ud2
+				// Canary function shape (PS5 clang):
+				//   cmp ...        ; compare guard
+				//   jne FAIL      ; skip cleanup if guard mismatched
+				//   <CLEANUP>     ; mov rax,rdi ; add rsp,... ; pop... ; ret
+				//   FAIL: call __stack_chk_fail ; ud2
+				// The `jne` sits ABOVE the cleanup epilogue, so we must scan
+				// UPWARD from the normal `C3` ret (just before the call) to find it.
+				// The normal ret is the byte before the E8 (call) which is 5 bytes
+				// before the ud2.
+				ulong callAddr = ud2Addr - 5;
+				ulong c3Addr = callAddr - 1;
+				ulong cleanupStart = 0;
+				// Scan in BOTH directions from c3Addr for the guarding jne.
+				for (ulong off = 0; off <= 64; off++)
 				{
-					// E8 (call __stack_chk_fail) is 5 bytes before the ud2;
-					// the normal `C3` ret is the byte before that call.
-					ulong callAddr = ud2Addr - 5;
-					ulong c3Addr = callAddr - 1;
-					ulong cleanupStart = 0;
-					for (ulong off = 0; off <= 16; off++)
+					// downward
+					ulong ad = c3Addr - off;
+					if (R8(ad, out var bd0))
 					{
-						ulong a = c3Addr - off;
-						if (R8(a, out var b0))
+						if (bd0 == 0x75) { cleanupStart = ad + 2; break; }       // jne rel8
+						if (bd0 == 0x0F && R8(ad + 1, out var bd1) && bd1 == 0x85)
+						{ cleanupStart = ad + 6; break; }                        // jne rel32
+					}
+					// upward
+					if (off > 0)
+					{
+						ulong au = c3Addr + off;
+						if (R8(au, out var bu0))
 						{
-							if (b0 == 0x75) { cleanupStart = a + 2; break; }   // jne rel8
-							if (b0 == 0x0F && R8(a + 1, out var b1) && b1 == 0x85)
-							{ cleanupStart = a + 6; break; }                    // jne rel32
+							if (bu0 == 0x75) { cleanupStart = au + 2; break; }   // jne rel8
+							if (bu0 == 0x0F && R8(au + 1, out var bu1) && bu1 == 0x85)
+							{ cleanupStart = au + 6; break; }                    // jne rel32
 						}
 					}
-					if (cleanupStart != 0)
+				}
+				if (cleanupStart != 0)
+				{
+					*(ulong*)(argPackPtr + 96) = cleanupStart;
+					cpuContext[CpuRegister.Rax] = 0;
+					Console.Error.WriteLine(
+						$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564) ret=0x{num7:X16} -> 0x{cleanupStart:X16}");
+					return 0;
+				}
+				// Layout-independent fallback: walk upward from num7 for the
+				// `48 3B .. 75 ..` (cmp ; jne) prologue and resume right
+				// after the jne, which is the start of the cleanup epilogue.
+				for (ulong off = 0; off <= 64; off++)
+				{
+					ulong p = num7 - off;
+					if (R8(p, out var c0) && c0 == 0x48 &&
+						R8(p + 1, out var c1) && c1 == 0x3B &&           // cmp
+						R8(p + 2, out var c2) && c2 == 0x75)           // jne rel8
 					{
-						*(ulong*)(argPackPtr + 96) = cleanupStart;
-						cpuContext[CpuRegister.Rax] = 0;
-						Console.Error.WriteLine(
-							$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564) ret=0x{num7:X16} -> 0x{cleanupStart:X16}");
-						return 0;
+						cleanupStart = p + 4;                            // jne is 2 bytes: resume at cleanup
+						break;
 					}
-					// Deterministic fallback: the exact canary function layout seen
-					// in Astro Bot (PPSA21564) is:
-					//   +0x00 cmp ... ; +0x04 jne fail ; +0x06 cleanup-start
-					//   ... ; +0x1A ret ; +0x1B call __stack_chk_fail ; +0x1C ud2
-					// So ud2 (num7) - 0x16 == cleanup-start. Use it when the byte
-					// scan above couldn't locate a jne (e.g. rare spacing).
-					if (num7 > 0x16 &&
-						R8(num7 - 0x1C, out var j0) && j0 == 0x48 &&           // cmp rsp-based preamble
-						R8(num7 - 0x18, out var j1) && j1 == 0x3B &&           // cmp
-						R8(num7 - 0x14, out var j2) && j2 == 0x75)             // jne rel8
+					if (R8(p, out var d0) && d0 == 0x0F &&
+						R8(p + 1, out var d1) && d1 == 0x85 &&           // jne rel32
+						R8(p - 2, out var d2) && d2 == 0x48 &&
+						R8(p - 1, out var d3) && d3 == 0x3B)           // cmp
 					{
-						cleanupStart = num7 - 0x16;
-						*(ulong*)(argPackPtr + 96) = cleanupStart;
-						cpuContext[CpuRegister.Rax] = 0;
-						Console.Error.WriteLine(
-							$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564, fallback) ret=0x{num7:X16} -> 0x{cleanupStart:X16}");
-						return 0;
+						cleanupStart = p + 6;
+						break;
 					}
+				}
+				if (cleanupStart != 0)
+				{
+					*(ulong*)(argPackPtr + 96) = cleanupStart;
+					cpuContext[CpuRegister.Rax] = 0;
+					Console.Error.WriteLine(
+						$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564, fallback) ret=0x{num7:X16} -> 0x{cleanupStart:X16}");
+					return 0;
 				}
 			}
 		}
