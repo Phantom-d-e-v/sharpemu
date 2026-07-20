@@ -294,19 +294,15 @@ public sealed partial class DirectExecutionBackend
 				SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId,
 				"PPSA21564", StringComparison.OrdinalIgnoreCase)))
 		{
-			var rc = (byte*)num7;
-			// Astro Bot: cmp [rsp-based] ; jne rel8 ; mov rax,rdi
-			if (rc[0] == 0x48 && rc[1] == 0x3B && rc[2] == 0x45 &&
-				rc[4] == 0x75 && rc[6] == 0x48 && rc[7] == 0x89 && rc[8] == 0xF8)
-			{
-				var recoveredReturn = num7 + 6;
-				*(ulong*)(argPackPtr + 96) = recoveredReturn;
-				cpuContext[CpuRegister.Rax] = 0;
-				Console.Error.WriteLine(
-					$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564) ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
-				return 0;
-			}
-			// Upstream general pattern: ud2 ; jne rel32 ; cmp rsp,imm8 ; resume num7-20
+									var rc = (byte*)num7;
+									// NOTE: the PPSA21564 (Astro Bot) canary recovery is handled by the
+									// real __stack_chk_fail HLE export (KernelRuntimeCompatExports) which
+									// resumes the guest at the bridge-provided return site without
+									// rewriting [RSP]. Writing num7+6 into the resume slot here made the
+									// backend re-enter mid-body (0x800FCB2CA) and trip an int3/breakpoint
+									// trap (0x80000003). So we intentionally do NOT match the Astro Bot
+									// pattern here and let dispatch fall through to the export.
+									// Upstream general pattern: ud2 ; jne rel32 ; cmp rsp,imm8 ; resume num7-20
 			if (rc[0] == 0x0F && rc[1] == 0x0B &&
 				((byte*)num7)[-22] == 0x75 && ((byte*)num7)[-21] == 0x0F &&
 				((byte*)num7)[-20] == 0x48 && ((byte*)num7)[-19] == 0x83 &&

@@ -1273,29 +1273,36 @@ public static class KernelRuntimeCompatExports
                 if (ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var retAddr))
                 {
                     // Astro Bot's canary-protected function (the one at
-                    // 0x800FCB2C4) has this return-site layout:
+                    // 0x800FCB2C4) has this layout:
                     //   0x...2C4: 48 3B 45 D0        cmp rbp, rsp
                     //   0x...2C8: 75 15              jne <fail>   (neutralized -> nop nop)
-                    //   0x...2CA: 48 89 F8           mov rax, rdi   <-- CLEANUP START (resume here)
+                    //   0x...2CA: 48 89 F8           mov rax, rdi
                     //   0x...2CD: 48 81 C4 48 1E..   add rsp, 0x1E48
                     //   0x...2D4: 5B 41 5C ...       pop registers
-                    //   0x...2DC: C3                 ret
-                    //   0x...2DD: E8 ....            call __stack_chk_fail
-                    //   0x...2E2: 0F 0B              ud2
-                    // The return address on the stack points at 0x...2C4 (the
-                    // cmp). Resuming at retAddr - 0x14 lands MID-INSTRUCTION
-                    // (inside the `add rsp`) and faults with 0xC000001D. The
-                    // correct resume is retAddr + 6, the start of the normal
-                    // cleanup epilogue that the neutralized jne would have
-                    // fallen through to.
-                    var recovered = retAddr + 0x6uL;
-                    if (ctx.TryWriteUInt64(ctx[CpuRegister.Rsp], recovered))
-                    {
-                        ctx[CpuRegister.Rax] = 0;
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip recovered (resumed epilogue) ret=0x{retAddr:X16} -> 0x{recovered:X16}");
-                        return 0;
-                    }
+                    //   0x...2DE: C3                 ret
+                    //   0x...2DF: E8 ....            call __stack_chk_fail (ud2 cold path)
+                    //
+                    // The HLE import bridge invokes this export with [RSP] already
+                    // set to 0x800FCB2C4 — the function's canary-check site — and
+                    // resumes guest execution at whatever [RSP] holds when we
+                    // return. The canary `jne` is neutralized, so re-running from
+                    // 0x800FCB2C4 simply falls through the (now no-op) cmp, runs
+                    // `mov rax,rdi`, tears down the frame, and `ret`s cleanly to
+                    // the caller. That is exactly the recovery we want, so we do
+                    // NOT rewrite [RSP]; we only pre-set RAX = RDI (the value the
+                    // epilogue will return) and return 0, letting the bridge
+                    // resume the function at 0x800FCB2C4.
+                    //
+                    // Writing any OTHER address into [RSP] (retAddr-0x14, +6, or
+                    // the `ret`) either lands mid-instruction (0xC000001D) or
+                    // strikes an int3/breakpoint trap (0x80000003) in the
+                    // direct-execution backend, because that page is not
+                    // authorized for re-entry at those offsets. Resuming at the
+                    // bridge-provided 0x800FCB2C4 is the only safe path.
+                    ctx[CpuRegister.Rax] = ctx[CpuRegister.Rdi];
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip recovered (resumed at 0x{retAddr:X16}).");
+                    return 0;
                 }
             }
             catch
