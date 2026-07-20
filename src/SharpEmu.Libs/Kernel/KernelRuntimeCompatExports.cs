@@ -1277,14 +1277,22 @@ public static class KernelRuntimeCompatExports
                     // epilogue (mov rax,rdi / add rsp / pop* / ret) and compute
                     // the exact resume offset. retAddr (0x800FCB2C4) is the ud2,
                     // NOT the function head; the real epilogue precedes it.
+                    // CpuContext only exposes TryReadUInt64, so read 8-byte
+                    // chunks and unpack each byte.
                     var diag = new System.Text.StringBuilder();
                     diag.Append($"[LOADER][DIAG] __stack_chk_fail pre-ud2 @0x{retAddr - 0x100uL:X16}: ");
-                    for (var i = 0; i < 0x100; i++)
+                    for (var c = 0; c < 0x20; c++)
                     {
-                        if (ctx.TryReadUInt8(retAddr - 0x100uL + (ulong)i, out var b))
-                            diag.Append($"{b:X2} ");
+                        var chunkAddr = retAddr - 0x100uL + (ulong)(c * 8);
+                        if (ctx.TryReadUInt64(chunkAddr, out var chunk))
+                        {
+                            for (var j = 0; j < 8; j++)
+                                diag.Append($"{(byte)(chunk >> (8 * j)):X2} ");
+                        }
                         else
-                            diag.Append("?? ");
+                        {
+                            diag.Append("?? ?? ?? ?? ?? ?? ?? ?? ");
+                        }
                     }
                     Console.Error.WriteLine(diag.ToString());
 
