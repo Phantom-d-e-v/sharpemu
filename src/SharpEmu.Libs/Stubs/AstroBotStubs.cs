@@ -132,19 +132,6 @@ public static class AstroBotStubs
         return Ok(ctx);
     }
 
-    // BfBDZGbti7A — get string/param. rdi=buf rsi=0x5F4 rdx=0x4D rcx=0 r8=0x3B r9=0x87400000.
-    // Returned ORBIS_GEN2_ERROR_INVALID_ARGUMENT before; produce an empty result.
-    [SysAbiExport(
-        Nid = "BfBDZGbti7A",
-        ExportName = "",
-        Target = Generation.Gen5,
-        LibraryName = "libSceSystemService")]
-    public static int AstroBfBDZGbti7A(CpuContext ctx)
-    {
-        SafeZero(ctx, ctx[CpuRegister.Rdi], 0x100);
-        return Ok(ctx);
-    }
-
     // SUEVes8gvmw — formatted-buffer write (snprintf/vsnprintf shaped:
     // rdi=dst buffer, rsi=0, rdx=format string, r8=length (as -8 signed),
     // r9=0x940). Game blocks on it during boot. Stub: NUL-terminate the
