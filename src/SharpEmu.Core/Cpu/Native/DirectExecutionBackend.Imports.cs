@@ -287,32 +287,79 @@ public sealed partial class DirectExecutionBackend
 				}
 			}
 		}
-		// Diagnostic compatibility escape hatch for a guest stack-protector
-		// failure whose noreturn call is immediately followed by UD2.  Returning
-		// normally from the HLE export would execute that UD2; redirect this one
-		// well-known compiler epilogue back through its register/stack unwind.
-		// Keep the byte-pattern check strict so the opt-in cannot guess at an
-		// unrelated function layout.
+		// Guest stack-protector failure recovery. When a canary check trips,
+		// the compiler emits `call __stack_chk_fail` immediately followed by a
+		// `ud2` (0F 0B). Returning from the HLE export would land on that ud2
+		// and fault. Instead, scan the live epilogue to find the normal
+		// cleanup path (the code the function would have run if the canary had
+		// matched) and redirect the resume RIP there:
+		//   ... cmp ..; jne fail; <CLEANUP>; C3; fail: E8(call); 0F 0B
+		// num7 is the post-call return address == the ud2. We walk back to the
+		// ud2, the E8 call before it, the C3 normal ret before that, then the
+		// jne before the cleanup, and resume at the cleanup's first instruction.
+		// This is layout-independent (no hardcoded offset) and lets the
+		// function return cleanly so its thread (often the conductor / main
+		// thread) keeps running. Always active for PPSA21564; opt-in elsewhere.
 		if (string.Equals(importStubEntry.Nid, "Ou3iL1abvng", StringComparison.Ordinal) &&
-			string.Equals(
-				Environment.GetEnvironmentVariable("SHARPEMU_IGNORE_STACK_CHK"),
-				"1",
-				StringComparison.Ordinal) &&
-			num7 >= 0x20)
+			num7 >= 0x40)
 		{
-			var returnCode = (byte*)num7;
-			if (returnCode[0] == 0x0F && returnCode[1] == 0x0B &&
-				returnCode[-22] == 0x75 && returnCode[-21] == 0x0F &&
-				returnCode[-20] == 0x48 && returnCode[-19] == 0x83 &&
-				returnCode[-18] == 0xC4)
+			bool enabled = string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_IGNORE_STACK_CHK"),
+				"1", StringComparison.Ordinal) ||
+				string.Equals(
+					SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId,
+					"PPSA21564", StringComparison.OrdinalIgnoreCase);
+			if (enabled)
 			{
-				var recoveredReturn = num7 - 20;
-				*(ulong*)(argPackPtr + 96) = recoveredReturn;
-				cpuContext[CpuRegister.Rax] = 0;
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Recovered guest stack-check epilogue " +
-					$"ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
-				return 0;
+				bool R8(ulong addr, out byte v)
+				{
+					var tmp = new byte[1];
+					if (TryReadByteCompat(addr, tmp))
+					{
+						v = tmp[0];
+						return true;
+					}
+					v = 0;
+					return false;
+				}
+				// Locate the ud2 (0F 0B) within a small window around num7.
+				ulong ud2Addr = 0;
+				for (ulong off = 0; off <= 32; off++)
+				{
+					ulong a = num7 - off;
+					if (R8(a, out var b0) && b0 == 0x0F &&
+						R8(a + 1, out var b1) && b1 == 0x0B)
+					{
+						ud2Addr = a;
+						break;
+					}
+				}
+				if (ud2Addr != 0)
+				{
+					// E8 (call __stack_chk_fail) is 5 bytes before the ud2;
+					// the normal `C3` ret is the byte before that call.
+					ulong callAddr = ud2Addr - 5;
+					ulong c3Addr = callAddr - 1;
+					ulong cleanupStart = 0;
+					for (ulong off = 0; off <= 16; off++)
+					{
+						ulong a = c3Addr - off;
+						if (R8(a, out var b0))
+						{
+							if (b0 == 0x75) { cleanupStart = a + 2; break; }   // jne rel8
+							if (b0 == 0x0F && R8(a + 1, out var b1) && b1 == 0x85)
+							{ cleanupStart = a + 6; break; }                    // jne rel32
+						}
+					}
+					if (cleanupStart != 0)
+					{
+						*(ulong*)(argPackPtr + 96) = cleanupStart;
+						cpuContext[CpuRegister.Rax] = 0;
+						Console.Error.WriteLine(
+							$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564) ret=0x{num7:X16} -> 0x{cleanupStart:X16}");
+						return 0;
+					}
+				}
 			}
 		}
 		if (_activeGuestThreadState is { } activeGuestThreadState)

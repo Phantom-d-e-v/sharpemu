@@ -1258,34 +1258,13 @@ public static class KernelRuntimeCompatExports
             {
             }
 
-            // Do NOT exit the guest thread. On PPSA21564 the canary trip is a
-            // false positive caused by emulator stack-layout differences, not a
-            // real buffer overflow. Exiting the thread here kills the conductor
-            // (main's primary thread), which deadlocks every other worker that
-            // is parked on a condvar/semaphore waiting for the conductor to
-            // broadcast — that is the SceSndzAudioOutMain-only-spin deadlock.
-            // Instead, resume the function's normal epilogue past the failed
-            // canary check (the return address on the stack points at the ud2
-            // cold path; rewinding 0x14 lands in the normal cleanup that
-            // precedes it) so the function returns cleanly and main continues.
-            try
-            {
-                if (ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var retAddr))
-                {
-                    var recovered = retAddr - 0x14uL;
-                    if (ctx.TryWriteUInt64(ctx[CpuRegister.Rsp], recovered))
-                    {
-                        ctx[CpuRegister.Rax] = 0;
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip recovered (resumed epilogue) ret=0x{retAddr:X16} -> 0x{recovered:X16}");
-                        return 0;
-                    }
-                }
-            }
-            catch
-            {
-            }
-
+            // The actual resume-past-ud2 redirect is handled in
+            // DirectExecutionBackend.Imports.cs (where the backend's resume RIP
+            // lives at argPackPtr+96), not here — writing guest [RSP] would be
+            // ignored by the backend and could corrupt the stack. Here we only
+            // neutralize the `jne` (so subsequent calls don't trip) and return
+            // 0 without exiting the thread. Exiting would kill the conductor
+            // (main's primary thread) and deadlock every parked worker.
             Console.Error.WriteLine(
                 $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip (neutralized, not exiting thread).");
             return 0;
