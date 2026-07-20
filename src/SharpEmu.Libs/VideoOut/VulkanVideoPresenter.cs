@@ -13516,7 +13516,7 @@ internal static unsafe class VulkanVideoPresenter
                 // frame (F05EB8) and ErrorDeviceLost on the next submit.
                 FlushBatchedGuestCommands();
                 WaitForGuestImageLastWrite(presentedGuestImage);
-                RecordGuestImageBlit(imageIndex, presentedGuestImage);
+                RecordGuestImageBlit(imageIndex, presentedGuestImage, frameSlot);
                 waitStage = NeedsShaderPresent(presentedGuestImage.Format, _swapchainFormat)
                     ? PipelineStageFlags.ColorAttachmentOutputBit
                     : PipelineStageFlags.TransferBit;
@@ -16631,7 +16631,8 @@ internal static unsafe class VulkanVideoPresenter
         private void RecordGuestImageShaderPresent(
             uint imageIndex,
             GuestImageResource source,
-            bool traceDestination)
+            bool traceDestination,
+            int frameSlot)
         {
             var packed10 = NeedsCpuPackedPresent(source.Format);
             var redInLsb = source.Format == Format.A2B10G10R10UnormPack32;
@@ -16775,14 +16776,16 @@ internal static unsafe class VulkanVideoPresenter
                     },
                     ImageExtent = new Extent3D(_extent.Width, _extent.Height, 1),
                 };
+                var stagingBuffer = _presentStagingBuffers[frameSlot];
                 _vk.CmdCopyImageToBuffer(
                     _commandBuffer,
                     _swapchainImages[imageIndex],
                     ImageLayout.TransferSrcOptimal,
-                    _stagingBuffer,
+                    stagingBuffer,
                     1,
                     &copyRegion);
                 _swapchainReadbackPending = true;
+                _swapchainReadbackFrameSlot = frameSlot;
 
                 var destinationToPresent = new ImageMemoryBarrier
                 {
@@ -16812,7 +16815,8 @@ internal static unsafe class VulkanVideoPresenter
 
         private void RecordGuestImageBlit(
             uint imageIndex,
-            GuestImageResource source)
+            GuestImageResource source,
+            int frameSlot)
         {
             var presentedCount = Interlocked.Increment(ref _presentedSwapchainCount);
             var periodicDumpInterval = SwapchainDumpInterval();
@@ -16828,7 +16832,7 @@ internal static unsafe class VulkanVideoPresenter
 
             if (NeedsShaderPresent(source.Format, _swapchainFormat))
             {
-                RecordGuestImageShaderPresent(imageIndex, source, traceDestination);
+                RecordGuestImageShaderPresent(imageIndex, source, traceDestination, frameSlot);
                 EndDebugLabel(_commandBuffer);
                 return;
             }
@@ -17063,14 +17067,16 @@ internal static unsafe class VulkanVideoPresenter
                     },
                     ImageExtent = new Extent3D(_extent.Width, _extent.Height, 1),
                 };
+                var stagingBuffer = _presentStagingBuffers[frameSlot];
                 _vk.CmdCopyImageToBuffer(
                     _commandBuffer,
                     _swapchainImages[imageIndex],
                     ImageLayout.TransferSrcOptimal,
-                    _stagingBuffer,
+                    stagingBuffer,
                     1,
                     &copyRegion);
                 _swapchainReadbackPending = true;
+                _swapchainReadbackFrameSlot = frameSlot;
             }
 
             var sourceToShaderRead = new ImageMemoryBarrier
@@ -17122,18 +17128,16 @@ internal static unsafe class VulkanVideoPresenter
         {
             _swapchainReadbackPending = false;
             var byteCount = checked((ulong)_extent.Width * _extent.Height * 4);
-            void* mapped;
-            Check(
-                _vk.MapMemory(_device, _stagingMemory, 0, byteCount, 0, &mapped),
-                "vkMapMemory(swapchain readback)");
-            try
+            var slot = _swapchainReadbackFrameSlot;
+            if (_presentStagingMapped.Length <= slot || _presentStagingMapped[slot] == 0)
             {
-                TraceSwapchainPixelBytes(new ReadOnlySpan<byte>(mapped, checked((int)byteCount)));
+                return;
             }
-            finally
-            {
-                _vk.UnmapMemory(_device, _stagingMemory);
-            }
+
+            TraceSwapchainPixelBytes(
+                new ReadOnlySpan<byte>(
+                    (void*)_presentStagingMapped[slot],
+                    checked((int)byteCount)));
         }
 
         private void TraceUploadedSwapchainPixels(ReadOnlySpan<byte> pixels)
@@ -17579,17 +17583,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             DestroyGuestPresentResources();
             DestroyPresentEncodeImage();
-            if (_stagingBuffer.Handle != 0)
-            {
-                _vk.DestroyBuffer(_device, _stagingBuffer, null);
-                _stagingBuffer = default;
-            }
-            if (_stagingMemory.Handle != 0)
-            {
-                _vk.FreeMemory(_device, _stagingMemory, null);
-                _stagingMemory = default;
-                _stagingSize = 0;
-            }
+            DestroyPresentStagingBuffers();
             foreach (var semaphore in _frameImageAvailable)
             {
                 if (semaphore.Handle != 0)
