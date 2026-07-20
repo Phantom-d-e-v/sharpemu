@@ -165,6 +165,177 @@ public static class SpirvFixedShaders
         return module.Build();
     }
 
+    /// <summary>
+    /// Present fragment for A2B10/A2R10 guest images whose CopyImageToBuffer
+    /// bytes need big-endian interpretation (Astro Bot scanout). Samples as
+    /// R32UI, byte-swaps the texel, then unpacks packed10 to float RGBA.
+    /// </summary>
+    public static byte[] CreatePacked10BePresentFragment(bool redInLeastSignificantBits)
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+
+        var voidType = module.TypeVoid();
+        var uintType = module.TypeInt(32, signed: false);
+        var intType = module.TypeInt(32, signed: true);
+        var floatType = module.TypeFloat(32);
+        var vec2Type = module.TypeVector(floatType, 2);
+        var ivec2Type = module.TypeVector(intType, 2);
+        var uvec2Type = module.TypeVector(uintType, 2);
+        var uvec4Type = module.TypeVector(uintType, 4);
+        var vec4Type = module.TypeVector(floatType, 4);
+        var inputVec4Pointer = module.TypePointer(SpirvStorageClass.Input, vec4Type);
+        var outputVec4Pointer = module.TypePointer(SpirvStorageClass.Output, vec4Type);
+        var imageType = module.TypeImage(
+            uintType,
+            SpirvImageDim.Dim2D,
+            depth: false,
+            arrayed: false,
+            multisampled: false,
+            sampled: 1,
+            SpirvImageFormat.R32ui);
+        var sampledImageType = module.TypeSampledImage(imageType);
+        var sampledImagePointer =
+            module.TypePointer(SpirvStorageClass.UniformConstant, sampledImageType);
+
+        var attribute = module.AddGlobalVariable(inputVec4Pointer, SpirvStorageClass.Input);
+        module.AddName(attribute, "attr0");
+        module.AddDecoration(attribute, SpirvDecoration.Location, 0);
+
+        var texture = module.AddGlobalVariable(
+            sampledImagePointer,
+            SpirvStorageClass.UniformConstant);
+        module.AddName(texture, "tex0");
+        module.AddDecoration(texture, SpirvDecoration.DescriptorSet, 0);
+        module.AddDecoration(texture, SpirvDecoration.Binding, 1);
+
+        var output = module.AddGlobalVariable(outputVec4Pointer, SpirvStorageClass.Output);
+        module.AddName(output, "outColor");
+        module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+        var functionType = module.TypeFunction(voidType);
+        var main = module.BeginFunction(voidType, functionType);
+        module.AddName(main, "main");
+        module.AddLabel();
+
+        var attributeValue = module.AddInstruction(SpirvOp.Load, vec4Type, attribute);
+        var uv = module.AddInstruction(
+            SpirvOp.VectorShuffle,
+            vec2Type,
+            attributeValue,
+            attributeValue,
+            0,
+            1);
+        var sampledImage = module.AddInstruction(SpirvOp.Load, sampledImageType, texture);
+        var image = module.AddInstruction(SpirvOp.Image, imageType, sampledImage);
+        var lod = module.Constant(uintType, 0);
+        var size = module.AddInstruction(SpirvOp.ImageQuerySizeLod, uvec2Type, image, lod);
+        var sizeX = module.AddInstruction(SpirvOp.CompositeExtract, uintType, size, 0);
+        var sizeY = module.AddInstruction(SpirvOp.CompositeExtract, uintType, size, 1);
+        var sizeXf = module.AddInstruction(SpirvOp.ConvertUToF, floatType, sizeX);
+        var sizeYf = module.AddInstruction(SpirvOp.ConvertUToF, floatType, sizeY);
+        var uvX = module.AddInstruction(SpirvOp.CompositeExtract, floatType, uv, 0);
+        var uvY = module.AddInstruction(SpirvOp.CompositeExtract, floatType, uv, 1);
+        var coordXf = module.AddInstruction(SpirvOp.FMul, floatType, uvX, sizeXf);
+        var coordYf = module.AddInstruction(SpirvOp.FMul, floatType, uvY, sizeYf);
+        var coordX = module.AddInstruction(SpirvOp.ConvertFToU, uintType, coordXf);
+        var coordY = module.AddInstruction(SpirvOp.ConvertFToU, uintType, coordYf);
+        var one = module.Constant(uintType, 1);
+        var maxX = module.AddInstruction(SpirvOp.ISub, uintType, sizeX, one);
+        var maxY = module.AddInstruction(SpirvOp.ISub, uintType, sizeY, one);
+        var boolType = module.TypeBool();
+        var tooWide = module.AddInstruction(SpirvOp.UGreaterThan, boolType, coordX, maxX);
+        var tooTall = module.AddInstruction(SpirvOp.UGreaterThan, boolType, coordY, maxY);
+        var clampedX = module.AddInstruction(SpirvOp.Select, uintType, tooWide, maxX, coordX);
+        var clampedY = module.AddInstruction(SpirvOp.Select, uintType, tooTall, maxY, coordY);
+        var coords = module.AddInstruction(
+            SpirvOp.CompositeConstruct,
+            uvec2Type,
+            clampedX,
+            clampedY);
+        // ImageOperands Lod = 0x2
+        var fetched = module.AddInstruction(
+            SpirvOp.ImageFetch,
+            uvec4Type,
+            image,
+            coords,
+            2,
+            lod);
+        var packedLe = module.AddInstruction(SpirvOp.CompositeExtract, uintType, fetched, 0);
+
+        // bswap32 so BE guest/readback layout matches CPU packed10 decode.
+        var maskFf = module.Constant(uintType, 0xFFu);
+        var maskFf00 = module.Constant(uintType, 0xFF00u);
+        var eight = module.Constant(uintType, 8);
+        var twentyFour = module.Constant(uintType, 24);
+        var b0 = module.AddInstruction(SpirvOp.BitwiseAnd, uintType, packedLe, maskFf);
+        b0 = module.AddInstruction(SpirvOp.ShiftLeftLogical, uintType, b0, twentyFour);
+        var b1 = module.AddInstruction(SpirvOp.BitwiseAnd, uintType, packedLe, maskFf00);
+        b1 = module.AddInstruction(SpirvOp.ShiftLeftLogical, uintType, b1, eight);
+        var b2 = module.AddInstruction(SpirvOp.ShiftRightLogical, uintType, packedLe, eight);
+        b2 = module.AddInstruction(SpirvOp.BitwiseAnd, uintType, b2, maskFf00);
+        var b3 = module.AddInstruction(SpirvOp.ShiftRightLogical, uintType, packedLe, twentyFour);
+        var packed = module.AddInstruction(SpirvOp.BitwiseOr, uintType, b0, b1);
+        packed = module.AddInstruction(SpirvOp.BitwiseOr, uintType, packed, b2);
+        packed = module.AddInstruction(SpirvOp.BitwiseOr, uintType, packed, b3);
+
+        var ten = module.Constant(uintType, 10);
+        var twenty = module.Constant(uintType, 20);
+        var thirty = module.Constant(uintType, 30);
+        var mask10 = module.Constant(uintType, 0x3FFu);
+        var mask2 = module.Constant(uintType, 0x3u);
+        var c0 = module.AddInstruction(SpirvOp.BitwiseAnd, uintType, packed, mask10);
+        var c1Shift = module.AddInstruction(SpirvOp.ShiftRightLogical, uintType, packed, ten);
+        var c1 = module.AddInstruction(SpirvOp.BitwiseAnd, uintType, c1Shift, mask10);
+        var c2Shift = module.AddInstruction(SpirvOp.ShiftRightLogical, uintType, packed, twenty);
+        var c2 = module.AddInstruction(SpirvOp.BitwiseAnd, uintType, c2Shift, mask10);
+        var aBits = module.AddInstruction(SpirvOp.ShiftRightLogical, uintType, packed, thirty);
+        aBits = module.AddInstruction(SpirvOp.BitwiseAnd, uintType, aBits, mask2);
+
+        uint redBits;
+        uint blueBits;
+        if (redInLeastSignificantBits)
+        {
+            redBits = c0;
+            blueBits = c2;
+        }
+        else
+        {
+            redBits = c2;
+            blueBits = c0;
+        }
+
+        var inv1023 = module.ConstantFloat(floatType, 1f / 1023f);
+        var inv3 = module.ConstantFloat(floatType, 1f / 3f);
+        var red = module.AddInstruction(SpirvOp.ConvertUToF, floatType, redBits);
+        red = module.AddInstruction(SpirvOp.FMul, floatType, red, inv1023);
+        var green = module.AddInstruction(SpirvOp.ConvertUToF, floatType, c1);
+        green = module.AddInstruction(SpirvOp.FMul, floatType, green, inv1023);
+        var blue = module.AddInstruction(SpirvOp.ConvertUToF, floatType, blueBits);
+        blue = module.AddInstruction(SpirvOp.FMul, floatType, blue, inv1023);
+        var alpha = module.AddInstruction(SpirvOp.ConvertUToF, floatType, aBits);
+        alpha = module.AddInstruction(SpirvOp.FMul, floatType, alpha, inv3);
+        var color = module.AddInstruction(
+            SpirvOp.CompositeConstruct,
+            vec4Type,
+            red,
+            green,
+            blue,
+            alpha);
+        module.AddStatement(SpirvOp.Store, output, color);
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        module.AddEntryPoint(
+            SpirvExecutionModel.Fragment,
+            main,
+            "main",
+            [attribute, texture, output]);
+        module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
+        _ = ivec2Type;
+        return module.Build();
+    }
+
     public static byte[] CreateSolidFragment(float red, float green, float blue, float alpha)
     {
         var module = new SpirvModuleBuilder();
