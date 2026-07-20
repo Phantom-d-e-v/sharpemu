@@ -2945,33 +2945,32 @@ public static partial class KernelMemoryCompatExports
 
                 if (!reserved)
                 {
-                    // Rosetta places the x86-64 process stack in the low
-                    // address window used by some fixed PS5 mappings. Do not
-                    // clobber that host memory: relocate the mapping and
-                    // return the actual address through the in/out pointer.
-                    if (OperatingSystem.IsMacOS())
-                    {
-                        var fallbackAddress = AlignUp(
-                            _nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress,
-                            effectiveAlignment);
-                        reserved = TryReserveGuestVirtualRange(
-                            ctx,
-                            fallbackAddress,
-                            length,
-                            protection,
-                            effectiveAlignment,
-                            out mappedAddress);
+                    // A fixed PS5 direct-memory mapping (the GPU accesses this
+                    // physical address directly) could not be reserved at the
+                    // requested guest address — usually because the host already
+                    // owns that virtual range (Rosetta stack on macOS, or other
+                    // reserved host regions on Windows/Linux). Relocate the
+                    // mapping to a free guest range and return the actual address
+                    // through the in/out pointer so the game's allocator sees a
+                    // successful fixed mapping. PS5 titles (e.g. Astro Bot /
+                    // PPSA21564) hard-ASSERT in DirectMemoryAllocator.cpp when
+                    // this returns ORBIS_GEN2_ERROR_NOT_FOUND, so relocating is
+                    // required for them to boot.
+                    var fallbackAddress = AlignUp(
+                        _nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress,
+                        effectiveAlignment);
+                    reserved = TryReserveGuestVirtualRange(
+                        ctx,
+                        fallbackAddress,
+                        length,
+                        protection,
+                        effectiveAlignment,
+                        out mappedAddress);
 
-                        if (reserved && ShouldTraceDirectMemory())
-                        {
-                            Console.Error.WriteLine(
-                                $"[LOADER][WARN] map_direct relocated fixed mapping: requested=0x{requestedAddress:X16} mapped=0x{mappedAddress:X16} len=0x{length:X16}");
-                        }
-                    }
-
-                    if (!reserved)
+                    if (reserved && ShouldTraceDirectMemory())
                     {
-                        mappedAddress = 0;
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] map_direct relocated fixed mapping: requested=0x{requestedAddress:X16} mapped=0x{mappedAddress:X16} len=0x{length:X16}");
                     }
                 }
             }
