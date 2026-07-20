@@ -398,6 +398,13 @@ public static class PadExports
     {
         // Reports the current DualSense trigger-effect state. We have none
         // active, so return a zeroed state and success.
+        //
+        // ScePadTriggerEffectState is a small struct; the game (PPSA21564
+        // verified) allocates only a 16-byte local for it on the caller's
+        // stack. Writing more than 16 bytes here overflows the caller's frame
+        // (clobbering its stack canary, saved registers, and return address),
+        // which corrupts the return path — so the zero-write must be exactly
+        // the struct size (16 bytes), never more.
         var handle = unchecked((int)ctx[CpuRegister.Rdi]);
         var stateAddress = ctx[CpuRegister.Rsi];
         if (!IsPrimaryPadHandle(handle))
@@ -406,7 +413,7 @@ public static class PadExports
         }
         if (stateAddress != 0)
         {
-            Span<byte> zero = stackalloc byte[128];
+            Span<byte> zero = stackalloc byte[16];
             zero.Clear();
             ctx.Memory.TryWrite(stateAddress, zero);
         }

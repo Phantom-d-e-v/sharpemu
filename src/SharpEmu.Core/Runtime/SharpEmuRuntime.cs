@@ -148,22 +148,6 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         _ = RegisterLoadedModule(normalizedEbootPath, image, isMain: true, isSystemModule: false);
         KernelRuntimeCompatExports.ConfigureProcessProcParamAddress(image.ProcParamAddress);
 
-        // Astro Bot (PPSA21564): one of the game's own canary-protected functions
-        // trips __stack_chk_fail on boot due to an emulator stack-layout false
-        // positive (the canary slot is intact). The direct-execution JIT compiles
-        // each guest function ONCE into host machine code keyed by guest VA, and
-        // never re-reads guest RAM afterwards. Patching the bytes at canary-trip
-        // time (via Marshal.WriteByte) is therefore useless — the JIT keeps
-        // executing its stale cached translation (which ends in `ud2` and traps).
-        // The ONLY reliable fix is to neutralize the canary check in the loaded
-        // image BEFORE the JIT ever compiles the function: NOP the `jne` so the
-        // epilogue always runs, and turn the `ud2` cold-path into `ret`. Done via
-        // _virtualMemory.TryWrite so the JIT compiles the corrected bytes.
-        if (string.Equals(image.TitleId, "PPSA21564", StringComparison.OrdinalIgnoreCase))
-        {
-            PatchAstroBotCanaryAtLoad(_virtualMemory);
-        }
-
         Console.Error.WriteLine($"[RUNTIME] Entry: 0x{image.EntryPoint:X16}");
         var generation = image.ElfHeader.AbiVersion == 2 ? Generation.Gen5 : Generation.Gen4;
         var activeImportStubs = new Dictionary<ulong, string>(image.ImportStubs);
@@ -933,31 +917,6 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         }
 
         return added;
-    }
-
-    // Astro Bot (PPSA21564) boot-time stack-canary false positive.
-    // Neutralizes the canary check in the LOADED IMAGE (before the direct-execution
-    // JIT compiles the function) so the JIT emits correct host code:
-    //   * 0x800FCB2A8: `75 15` (jne FAIL) -> `90 90` (nop nop) so the epilogue
-    //     always falls through to its own `ret`.
-    //   * 0x800FCB2E4: `0F 0B` (ud2, noreturn trap) -> `C3 90` (ret; pad) so any
-    //     fall-through also returns cleanly instead of trapping.
-    // Image base is fixed at 0x800000000 for eboot.bin, so these VAs are stable.
-    // Must use IVirtualMemory.TryWrite (the backing store the JIT reads from), not
-    // Marshal.WriteByte — the latter writes host VA and never reaches the JIT cache.
-    private static void PatchAstroBotCanaryAtLoad(IVirtualMemory virtualMemory)
-    {
-        const ulong jneAddress = 0x0000000800FCB2A8uL;
-        const ulong ud2Address = 0x0000000800FCB2E4uL;
-
-        var jnePatch = new byte[] { 0x90, 0x90 }; // 75 15 -> nop nop
-        var ud2Patch = new byte[] { 0xC3, 0x90 }; // 0F 0B -> ret ; pad
-
-        bool jneOk = virtualMemory.TryWrite(jneAddress, jnePatch);
-        bool ud2Ok = virtualMemory.TryWrite(ud2Address, ud2Patch);
-
-        Console.Error.WriteLine(
-            $"[LOADER][WARN] PPSA21564 canary image patched at load (jne@{jneAddress:X16}={jneOk}, ud2@{ud2Address:X16}={ud2Ok})");
     }
 
     private static bool IsPreferredRuntimeSymbolAddress(ulong existingAddress, ulong candidateAddress)

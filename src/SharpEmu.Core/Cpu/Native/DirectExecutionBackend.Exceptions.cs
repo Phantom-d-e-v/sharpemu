@@ -305,30 +305,102 @@ public sealed partial class DirectExecutionBackend
 			// from an indirect `call` (register or memory) whose target was NULL.
 			// The return address is at host [rsp]; the `call` instruction is the one
 			// immediately preceding it. Decode it to learn which pointer was NULL.
-			if (rip == 0 && _cpuContext != null && TryReadHostQword(rsp, out ulong retAddr) && retAddr >= 0x60)
+			if (rip == 0 && _cpuContext != null && TryReadHostQword(rsp, out ulong retAddr))
 			{
-				Console.Error.WriteLine("[LOADER][INFO]   NULL-CALL decoder: returnAddr=0x" + retAddr.ToString("X16"));
-				// Scan backwards up to 15 bytes (max x86 call len) to locate the
-				// instruction that ends exactly at retAddr.
-				ulong scanBase = retAddr > 15 ? retAddr - 15 : 0;
-				if (IcedDecoder.TryReadGuestBytes(_cpuContext.Memory, scanBase, maxLen: 15, out var callBytes))
+				if (retAddr >= 0x60)
 				{
-					ulong cursor = scanBase;
-					while (cursor < retAddr)
+					Console.Error.WriteLine("[LOADER][INFO]   NULL-CALL decoder: returnAddr=0x" + retAddr.ToString("X16"));
+					// Scan backwards up to 15 bytes (max x86 call len) to locate the
+					// instruction that ends exactly at retAddr.
+					ulong scanBase = retAddr > 15 ? retAddr - 15 : 0;
+					if (IcedDecoder.TryReadGuestBytes(_cpuContext.Memory, scanBase, maxLen: 15, out var callBytes))
 					{
-						if (!IcedDecoder.TryDecode(cursor, callBytes[(int)(cursor - scanBase)..], out var insn))
+						ulong cursor = scanBase;
+						while (cursor < retAddr)
 						{
-							break;
-						}
+							if (!IcedDecoder.TryDecode(cursor, callBytes[(int)(cursor - scanBase)..], out var insn))
+							{
+								break;
+							}
 
-						if (insn.Rip + (ulong)insn.Bytes.Length == retAddr)
+							if (insn.Rip + (ulong)insn.Bytes.Length == retAddr)
+							{
+								Console.Error.WriteLine(
+									$"[LOADER][INFO]   NULL-CALL site: 0x{insn.Rip:X16}: {insn.Text} bytes={IcedDecoder.FormatBytes(insn.Bytes)}");
+								break;
+							}
+
+							cursor += (ulong)insn.Bytes.Length;
+						}
+					}
+				}
+				else
+				{
+					// [rsp] does not look like a return address (e.g. RIP=0 was reached
+					// via an indirect `jmp` tail call, or the frame was corrupted). Scan
+					// further up the stack for a qword that falls inside the guest
+					// executable range and treat it as a candidate return site.
+					try
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][INFO]   NULL-CALL: [rsp] is not a return address (0x{retAddr:X16}); " +
+							"RIP=0 likely reached via indirect jmp or corrupted return — scanning stack for candidate frames");
+
+						int candidatesFound = 0;
+						for (ulong scanOffset = 0; scanOffset <= 0x100 && candidatesFound < 4; scanOffset += 8)
 						{
+							ulong scanAddr = rsp + scanOffset;
+							if (!TryReadHostQword(scanAddr, out ulong candidate) || !IsGuestCodeAddress(candidate))
+							{
+								continue;
+							}
+
+							candidatesFound++;
 							Console.Error.WriteLine(
-								$"[LOADER][INFO]   NULL-CALL site: 0x{insn.Rip:X16}: {insn.Text} bytes={IcedDecoder.FormatBytes(insn.Bytes)}");
-							break;
+								$"[LOADER][INFO]   NULL-CALL: candidate #{candidatesFound} at [rsp+0x{scanOffset:X}] = 0x{candidate:X16}");
+
+							const int windowLen = 24;
+							ulong windowBase = candidate > windowLen ? candidate - windowLen : 0;
+							if (!IcedDecoder.TryReadGuestBytes(_cpuContext.Memory, windowBase, maxLen: windowLen, out var windowBytes))
+							{
+								continue;
+							}
+
+							bool matched = false;
+							ulong cursor = windowBase;
+							while (cursor < candidate)
+							{
+								if (!IcedDecoder.TryDecode(cursor, windowBytes[(int)(cursor - windowBase)..], out var insn))
+								{
+									break;
+								}
+
+								if (insn.Rip + (ulong)insn.Bytes.Length == candidate)
+								{
+									Console.Error.WriteLine(
+										$"[LOADER][INFO]   NULL-CALL site: 0x{insn.Rip:X16}: {insn.Text} bytes={IcedDecoder.FormatBytes(insn.Bytes)}");
+									matched = true;
+									break;
+								}
+
+								cursor += (ulong)insn.Bytes.Length;
+							}
+
+							if (!matched)
+							{
+								Console.Error.WriteLine(
+									$"[LOADER][INFO]   NULL-CALL: raw bytes before 0x{candidate:X16} = {IcedDecoder.FormatBytes(windowBytes)}");
+							}
 						}
 
-						cursor += (ulong)insn.Bytes.Length;
+						if (candidatesFound == 0)
+						{
+							Console.Error.WriteLine("[LOADER][INFO]   NULL-CALL: no candidate return addresses found in [rsp..rsp+0x100]");
+						}
+					}
+					catch (Exception ex)
+					{
+						Console.Error.WriteLine($"[LOADER][WARNING]   NULL-CALL stack scan failed: {ex.Message}");
 					}
 				}
 
@@ -338,6 +410,74 @@ public sealed partial class DirectExecutionBackend
 					$"[LOADER][INFO]   NULL-CALL registers: rax=0x{rax:X16} rbx=0x{rbx:X16} rcx=0x{rcx:X16} " +
 					$"rdx=0x{rdx:X16} rsi=0x{rsi:X16} rdi=0x{rdi:X16} r8=0x{r8:X16} r9=0x{r9:X16} " +
 					$"r10=0x{r10:X16} r11=0x{r11:X16} r12=0x{r12:X16} r13=0x{r13:X16} r14=0x{r14:X16} r15=0x{r15:X16}");
+
+				// RIP0-DIAG #1: wide host-stack dump around the fault frame. Each
+				// qword is classified so we can eyeball guest return addresses,
+				// stack-internal links and zero fill. Long zero runs are collapsed.
+				try
+				{
+					Console.Error.WriteLine("[LOADER][INFO]   RIP0-DIAG WIDE STACK DUMP [rsp-0x40 .. rsp+0x1F8]:");
+					int zeroRun = 0;
+					for (long off = -0x40; off <= 0x1F8; off += 8)
+					{
+						ulong stackAddr = unchecked(rsp + (ulong)off);
+						if (!TryReadHostQword(stackAddr, out ulong sv))
+						{
+							if (zeroRun > 2)
+							{
+								Console.Error.WriteLine($"[LOADER][INFO]   RIP0-DIAG   ... {zeroRun - 2} more zero qwords");
+							}
+							zeroRun = 0;
+							continue;
+						}
+
+						string offText = off >= 0 ? $"+0x{off:X}" : $"-0x{-off:X}";
+						string tag;
+						if (sv == 0)
+						{
+							tag = "zero";
+						}
+						else if (IsGuestCodeAddress(sv))
+						{
+							tag = "guest-code";
+						}
+						else if (sv is >= 0x7FFF00000000UL and < 0x800000000000UL)
+						{
+							tag = "stack";
+						}
+						else
+						{
+							tag = "other";
+						}
+
+						if (sv == 0)
+						{
+							zeroRun++;
+							if (zeroRun <= 2)
+							{
+								Console.Error.WriteLine($"[LOADER][INFO]   RIP0-DIAG   [rsp{offText}] = 0x{sv:X16} ({tag})");
+							}
+						}
+						else
+						{
+							if (zeroRun > 2)
+							{
+								Console.Error.WriteLine($"[LOADER][INFO]   RIP0-DIAG   ... {zeroRun - 2} more zero qwords");
+							}
+							zeroRun = 0;
+							Console.Error.WriteLine($"[LOADER][INFO]   RIP0-DIAG   [rsp{offText}] = 0x{sv:X16} ({tag})");
+						}
+					}
+
+					if (zeroRun > 2)
+					{
+						Console.Error.WriteLine($"[LOADER][INFO]   RIP0-DIAG   ... {zeroRun - 2} more zero qwords");
+					}
+				}
+				catch (Exception ex)
+				{
+					Console.Error.WriteLine($"[LOADER][WARNING]   RIP0-DIAG wide stack dump failed: {ex.Message}");
+				}
 			}
 
 			try
@@ -1155,6 +1295,11 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
+	}
+
+	private static bool IsGuestCodeAddress(ulong address)
+	{
+		return address is >= 0x800000000UL and < 0x830000000UL;
 	}
 
 	private unsafe static bool TryReadHostBytes(ulong address, byte[] buffer)
