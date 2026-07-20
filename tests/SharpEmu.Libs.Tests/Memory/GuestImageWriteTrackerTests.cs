@@ -132,4 +132,27 @@ public sealed unsafe class GuestImageWriteTrackerTests
 
         Assert.False(GuestImageWriteTracker.TryGetWriteGeneration(0xDEAD_0000_0000UL, out _));
     }
+
+    [Fact]
+    public void ManagedWriteInvalidatesTrackedImageOnEveryHost()
+    {
+        var address = AllocateTrackedPages(out var allocation);
+        try
+        {
+            GuestImageWriteTracker.Track(address, TrackedByteCount);
+            Assert.True(GuestImageWriteTracker.TryGetWriteGeneration(address, out var generation));
+            Assert.Equal(0, generation);
+
+            GuestImageWriteTracker.NotifyManagedWrite(address + 16, 32);
+
+            Assert.True(GuestImageWriteTracker.PeekDirty(address));
+            Assert.True(GuestImageWriteTracker.TryGetWriteGeneration(address, out generation));
+            Assert.Equal(1, generation);
+        }
+        finally
+        {
+            GuestImageWriteTracker.Untrack(address);
+            NativeMemory.AlignedFree(allocation);
+        }
+    }
 }

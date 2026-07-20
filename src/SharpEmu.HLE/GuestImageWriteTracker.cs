@@ -80,8 +80,14 @@ public static unsafe class GuestImageWriteTracker
 
     private static RangeSnapshot _rangeSnapshot = RangeSnapshot.Empty;
 
-    private static readonly bool _enabled = !OperatingSystem.IsWindows() &&
+    // Managed HLE writes are observable on every host. Native guest stores use
+    // page protection and a fault bridge, which is currently POSIX-only.
+    private static readonly bool _managedWriteTrackingEnabled =
         Environment.GetEnvironmentVariable("SHARPEMU_GUEST_IMAGE_CPU_SYNC") != "0";
+    private static readonly bool _enabled =
+        _managedWriteTrackingEnabled && !OperatingSystem.IsWindows();
+    private static readonly bool _nativeWriteFaultTrackingEnabled =
+        _enabled;
     private static readonly (bool Wildcard, ulong[] Addresses) _lifetimeTraceFilter =
         ParseAddressList(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGE_ADDRS"));
     private static readonly (bool Wildcard, string[] Sources) _lifetimeSourceTraceFilter =
@@ -92,7 +98,7 @@ public static unsafe class GuestImageWriteTracker
         _lifetimeSourceTraceFilter.Wildcard ||
         _lifetimeSourceTraceFilter.Sources.Length != 0;
     private static readonly long _lifetimeTraceEpochNanoseconds =
-        _enabled && _lifetimeTraceEnabled ? GetMonotonicNanoseconds() : 0;
+        _nativeWriteFaultTrackingEnabled && _lifetimeTraceEnabled ? GetMonotonicNanoseconds() : 0;
     private static long _lifetimeTraceSequence;
 
     [DllImport("libc", EntryPoint = "mprotect", SetLastError = true)]
@@ -110,7 +116,7 @@ public static unsafe class GuestImageWriteTracker
     /// </summary>
     public static void WarmUp()
     {
-        if (!_enabled)
+        if (!_nativeWriteFaultTrackingEnabled)
         {
             return;
         }
@@ -140,7 +146,7 @@ public static unsafe class GuestImageWriteTracker
         long sourceSequence = 0,
         string source = "unspecified")
     {
-        if (!_enabled || address == 0 || byteCount == 0)
+        if (!_managedWriteTrackingEnabled || address == 0 || byteCount == 0)
         {
             return;
         }
@@ -204,7 +210,7 @@ public static unsafe class GuestImageWriteTracker
 
     public static void Untrack(ulong address)
     {
-        if (!_enabled)
+        if (!_managedWriteTrackingEnabled)
         {
             return;
         }
@@ -227,7 +233,7 @@ public static unsafe class GuestImageWriteTracker
     /// </summary>
     public static bool ConsumeDirty(ulong address)
     {
-        if (!_enabled)
+        if (!_managedWriteTrackingEnabled)
         {
             return false;
         }
@@ -251,7 +257,7 @@ public static unsafe class GuestImageWriteTracker
     /// </summary>
     public static bool PeekDirty(ulong address)
     {
-        if (!_enabled)
+        if (!_managedWriteTrackingEnabled)
         {
             return false;
         }
@@ -270,7 +276,7 @@ public static unsafe class GuestImageWriteTracker
 
     public static void Rearm(ulong address)
     {
-        if (!_enabled)
+        if (!_managedWriteTrackingEnabled)
         {
             return;
         }
@@ -292,7 +298,7 @@ public static unsafe class GuestImageWriteTracker
     public static bool TryGetWriteGeneration(ulong address, out long generation)
     {
         generation = 0;
-        if (!_enabled)
+        if (!_managedWriteTrackingEnabled)
         {
             return false;
         }
@@ -319,7 +325,7 @@ public static unsafe class GuestImageWriteTracker
     /// </summary>
     public static void NotifyManagedWrite(ulong address, ulong byteCount)
     {
-        if (!_enabled || address == 0 || byteCount == 0)
+        if (!_managedWriteTrackingEnabled || address == 0 || byteCount == 0)
         {
             return;
         }
@@ -335,6 +341,12 @@ public static unsafe class GuestImageWriteTracker
         var snapshot = Volatile.Read(ref _rangeSnapshot);
         if (snapshot.Ranges.Length == 0 || end <= snapshot.Start || address >= snapshot.End)
         {
+            return;
+        }
+
+        if (!_nativeWriteFaultTrackingEnabled)
+        {
+            MarkManagedWrite(snapshot.Ranges, address, end);
             return;
         }
 
@@ -378,7 +390,7 @@ public static unsafe class GuestImageWriteTracker
     /// </summary>
     public static bool TryHandleWriteFault(ulong faultAddress)
     {
-        if (!_enabled || faultAddress == 0)
+        if (!_nativeWriteFaultTrackingEnabled || faultAddress == 0)
         {
             return false;
         }
@@ -497,6 +509,10 @@ public static unsafe class GuestImageWriteTracker
 
         // A new publication/rearm starts a new first-write lifetime.
         Volatile.Write(ref range.FirstCpuWriteSeen, 0);
+        if (!_nativeWriteFaultTrackingEnabled)
+        {
+            return;
+        }
         var failed = Mprotect(
             (nint)range.Start,
             (nuint)(range.End - range.Start),
@@ -518,7 +534,7 @@ public static unsafe class GuestImageWriteTracker
     {
         FlushPendingFirstCpuWrite(range);
         var wasArmed = Interlocked.Exchange(ref range.Armed, 0) == 1;
-        if (wasArmed)
+        if (wasArmed && _nativeWriteFaultTrackingEnabled)
         {
             _ = Mprotect(
                 (nint)range.Start,
@@ -529,6 +545,26 @@ public static unsafe class GuestImageWriteTracker
         if (range.TraceLifetime)
         {
             TraceLifetime(range, wasArmed ? operation : $"{operation}-already-disarmed");
+        }
+    }
+
+    private static void MarkManagedWrite(TrackedRange[] ranges, ulong start, ulong end)
+    {
+        lock (_gate)
+        {
+            foreach (var range in ranges)
+            {
+                if (range.Start >= end || range.End <= start)
+                {
+                    continue;
+                }
+
+                if (Interlocked.Exchange(ref range.Armed, 0) != 0)
+                {
+                    Interlocked.Increment(ref range.WriteGeneration);
+                }
+                Volatile.Write(ref range.Dirty, 1);
+            }
         }
     }
 
