@@ -88,17 +88,18 @@ SPDX-License-Identifier: GPL-2.0-or-later
   </Target>
 
   <!-- On Windows a lingering SharpEmu.exe keeps the output DLLs locked, causing
-       MSB3027 and forcing you to run a stale binary. Force-kill it before
-       copying outputs so every build starts clean. We deliberately do NOT kill
-       dotnet.exe here: the running build IS a dotnet.exe, so killing it would
-       self-terminate the build. The emulator (SharpEmu.exe) is the only
-       process that legitimately holds the output DLLs open at build time.
-       Guarded to Windows only; no-op on Linux/macOS. -->
+       MSB3027 and forcing you to run a stale binary. Best-effort kill it before
+       copying outputs so a clean build can proceed. We use a wrapper that always
+       returns success (taskkill exits non-zero when the process is already gone
+       or refuses to die, and we must NOT let that fail the build). We do NOT
+       kill dotnet.exe here: the running build IS a dotnet.exe, so killing it
+       would self-terminate the build. Guarded to Windows only; no-op elsewhere. -->
   <Target Name="KillStaleSharpEmuBeforeBuild"
           BeforeTargets="PrepareForBuild;CoreCompile"
           Condition="'$(OS)' == 'Windows_NT'">
-    <Exec Command="taskkill /F /IM SharpEmu.exe"
+    <Exec Command="cmd /c &quot;taskkill /F /IM SharpEmu.exe &gt;nul 2&gt;nul || exit /b 0&quot;"
           IgnoreExitCode="true"
+          ContinueOnError="true"
           EchoOff="true"
           StandardOutputImportance="low"
           StandardErrorImportance="low" />
