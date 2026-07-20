@@ -1272,7 +1272,23 @@ public static class KernelRuntimeCompatExports
             {
                 if (ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var retAddr))
                 {
-                    var recovered = retAddr - 0x14uL;
+                    // Astro Bot's canary-protected function (the one at
+                    // 0x800FCB2C4) has this return-site layout:
+                    //   0x...2C4: 48 3B 45 D0        cmp rbp, rsp
+                    //   0x...2C8: 75 15              jne <fail>   (neutralized -> nop nop)
+                    //   0x...2CA: 48 89 F8           mov rax, rdi   <-- CLEANUP START (resume here)
+                    //   0x...2CD: 48 81 C4 48 1E..   add rsp, 0x1E48
+                    //   0x...2D4: 5B 41 5C ...       pop registers
+                    //   0x...2DC: C3                 ret
+                    //   0x...2DD: E8 ....            call __stack_chk_fail
+                    //   0x...2E2: 0F 0B              ud2
+                    // The return address on the stack points at 0x...2C4 (the
+                    // cmp). Resuming at retAddr - 0x14 lands MID-INSTRUCTION
+                    // (inside the `add rsp`) and faults with 0xC000001D. The
+                    // correct resume is retAddr + 6, the start of the normal
+                    // cleanup epilogue that the neutralized jne would have
+                    // fallen through to.
+                    var recovered = retAddr + 0x6uL;
                     if (ctx.TryWriteUInt64(ctx[CpuRegister.Rsp], recovered))
                     {
                         ctx[CpuRegister.Rax] = 0;
