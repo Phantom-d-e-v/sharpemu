@@ -2994,9 +2994,12 @@ internal static unsafe class VulkanVideoPresenter
         private readonly List<(VkBuffer Buffer, DeviceMemory Memory)> _batchRetireBuffers = new();
         private const int MaxRecycledGuestFences = 32;
         private const int MaxRecycledGuestCommandBuffers = 32;
-        private VkBuffer _stagingBuffer;
-        private DeviceMemory _stagingMemory;
         private ulong _stagingSize;
+        // Per-slot staging avoids WaitAllFrameSlots on every CPU upload.
+        private VkBuffer[] _presentStagingBuffers = [];
+        private DeviceMemory[] _presentStagingMemory = [];
+        private nint[] _presentStagingMapped = [];
+        private int _swapchainReadbackFrameSlot;
         // Perf overlay: CPU-rasterized panel copied through per-slot staging
         // buffers into one image, then blitted onto the swapchain.
         private Image _overlayImage;
@@ -3025,11 +3028,12 @@ internal static unsafe class VulkanVideoPresenter
         private Fence _guestReadbackFence;
         private int _directPresentationCount;
         private bool _loggedPresentRoute;
-        // Cached A2B10→BGRA converts keyed by guest address + content-write
-        // timeline (flip snapshots freeze source.LastWriteTimeline into
-        // ContentWriteTimeline so flip-copy fence stamps do not bust the cache).
-        private readonly Dictionary<(ulong Address, ulong ContentTimeline), byte[]>
-            _cachedPackedPresentBgraByImage = new();
+        // Cached A2B10→BGRA converts keyed by guest scanout address. Timeline
+        // keys miss when the guest rewrites identical boot pixels (live RT
+        // LastWriteTimeline advances; ContentWriteTimeline stays 0 so the key
+        // falls back to LastWriteTimeline). Address-only reuse skips the
+        // multi-second readback+convert for stable boot frames.
+        private readonly Dictionary<ulong, byte[]> _cachedPackedPresentBgraByAddress = new();
         private readonly Dictionary<ulong, long> _presentedGuestImageTraceCounts = new();
         private readonly Dictionary<ulong, GuestImageResource> _guestImages = new();
         private readonly record struct GuestImageVariantKey(
@@ -4656,7 +4660,7 @@ internal static unsafe class VulkanVideoPresenter
             _commandBuffer = _frameCommandBuffers[0];
             _presentationCommandBuffer = _commandBuffer;
 
-            CreateStagingBuffer((ulong)_extent.Width * _extent.Height * 4);
+            CreatePresentStagingBuffers((ulong)_extent.Width * _extent.Height * 4);
             CreateOverlayResources();
         }
 
@@ -10003,14 +10007,71 @@ internal static unsafe class VulkanVideoPresenter
             return buffer;
         }
 
+        private void CreatePresentStagingBuffers(ulong size)
+        {
+            DestroyPresentStagingBuffers();
+            _stagingSize = size;
+            _presentStagingBuffers = new VkBuffer[MaxFramesInFlight];
+            _presentStagingMemory = new DeviceMemory[MaxFramesInFlight];
+            _presentStagingMapped = new nint[MaxFramesInFlight];
+            for (var slot = 0; slot < MaxFramesInFlight; slot++)
+            {
+                _presentStagingBuffers[slot] = CreateBuffer(
+                    size,
+                    BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit,
+                    MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                    out _presentStagingMemory[slot]);
+                void* mapped;
+                Check(
+                    _vk.MapMemory(_device, _presentStagingMemory[slot], 0, size, 0, &mapped),
+                    "vkMapMemory(present staging)");
+                _presentStagingMapped[slot] = (nint)mapped;
+            }
+        }
+
+        private void DestroyPresentStagingBuffers()
+        {
+            if (_presentStagingMapped.Length > 0)
+            {
+                for (var slot = 0; slot < _presentStagingMapped.Length; slot++)
+                {
+                    if (_presentStagingMapped[slot] != 0 &&
+                        slot < _presentStagingMemory.Length &&
+                        _presentStagingMemory[slot].Handle != 0)
+                    {
+                        _vk.UnmapMemory(_device, _presentStagingMemory[slot]);
+                    }
+                }
+            }
+
+            foreach (var buffer in _presentStagingBuffers)
+            {
+                if (buffer.Handle != 0)
+                {
+                    _vk.DestroyBuffer(_device, buffer, null);
+                }
+            }
+
+            foreach (var memory in _presentStagingMemory)
+            {
+                if (memory.Handle != 0)
+                {
+                    _vk.FreeMemory(_device, memory, null);
+                }
+            }
+
+            _presentStagingBuffers = [];
+            _presentStagingMemory = [];
+            _presentStagingMapped = [];
+            _stagingSize = 0;
+        }
+
+        private static bool ShouldSampleSwapchainDump(int presentationCount, long interval, bool tracedOnce) =>
+            interval <= 0 ? !tracedOnce : presentationCount % interval == 0;
+
         private void CreateStagingBuffer(ulong size)
         {
-            _stagingBuffer = CreateBuffer(
-                size,
-                BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-                out _stagingMemory);
-            _stagingSize = size;
+            CreatePresentStagingBuffers(size);
         }
 
         private uint FindMemoryType(uint typeBits, MemoryPropertyFlags requiredFlags)
@@ -13294,21 +13355,25 @@ internal static unsafe class VulkanVideoPresenter
                     }
                 }
 
-                if (!_loggedPresentRoute &&
-                    ShouldTracePresentedGuestImageContentsForDiagnostics())
+                if (!_loggedPresentRoute)
                 {
                     _loggedPresentRoute = true;
-                    var route = pixels is not null
-                        ? "cpu"
+                    var route = pixels is not null &&
+                                !_forceGpuPackedPresent &&
+                                NeedsCpuPackedPresent(presentedGuestImage.Format)
+                        ? "cpu_packed"
                         : NeedsShaderPresent(presentedGuestImage.Format, _swapchainFormat)
-                            ? "shader"
-                            : "blit";
+                            ? "gpu_shader"
+                            : pixels is not null
+                                ? "cpu_bgra"
+                                : "gpu_blit";
                     Console.Error.WriteLine(
-                        "[LOADER][TRACE] " +
-                        $"vk.present_route={route} " +
+                        "[LOADER][INFO] " +
+                        $"vk.present_path={route} " +
                         $"format={presentedGuestImage.Format} " +
                         $"layout={presentedGuestImage.Layout} " +
                         $"addr=0x{presentedGuestImage.Address:X16} " +
+                        $"packed10_decode=be_opaque " +
                         $"force_gpu_packed={_forceGpuPackedPresent}");
                 }
             }
@@ -13385,19 +13450,17 @@ internal static unsafe class VulkanVideoPresenter
 
             if (pixels is not null)
             {
-                // The staging buffer is shared across frame slots; a CPU
-                // pixel upload (splash / host frames) degrades to serial
-                // presentation rather than corrupting an in-flight copy.
-                WaitAllFrameSlots();
-                void* mapped;
-                Check(
-                    _vk.MapMemory(_device, _stagingMemory, 0, (ulong)pixels.Length, 0, &mapped),
-                    "vkMapMemory");
-                fixed (byte* source = pixels)
+                if (_presentStagingMapped.Length <= frameSlot ||
+                    _presentStagingMapped[frameSlot] == 0)
                 {
-                    System.Buffer.MemoryCopy(source, mapped, pixels.Length, pixels.Length);
+                    throw new InvalidOperationException(
+                        "Present staging buffer is unavailable for this frame slot.");
                 }
-                _vk.UnmapMemory(_device, _stagingMemory);
+
+                pixels.AsSpan().CopyTo(
+                    new Span<byte>(
+                        (void*)_presentStagingMapped[frameSlot],
+                        pixels.Length));
             }
 
             Check(_vk.ResetCommandBuffer(_commandBuffer, 0), "vkResetCommandBuffer");
@@ -13411,7 +13474,15 @@ internal static unsafe class VulkanVideoPresenter
             PipelineStageFlags waitStage;
             if (pixels is not null)
             {
-                RecordUpload(imageIndex);
+                var traceCpuSwapchain =
+                    guestReadbackPresent &&
+                    _traceSwapchainImagesEnabled &&
+                    ShouldSampleSwapchainDump(
+                        _directPresentationCount,
+                        SwapchainDumpInterval(),
+                        _tracedPresentedSwapchain);
+                _tracedPresentedSwapchain |= traceCpuSwapchain;
+                RecordUpload(imageIndex, frameSlot, traceCpuSwapchain);
                 waitStage = PipelineStageFlags.TransferBit;
             }
             else if (presentation.DrawKind == GuestDrawKind.FullscreenBarycentric)
@@ -13553,7 +13624,11 @@ internal static unsafe class VulkanVideoPresenter
             }
             else if (guestReadbackPresent && _traceSwapchainImagesEnabled)
             {
-                TraceUploadedSwapchainPixels(pixels!);
+                WaitFrameSlot(frameSlot);
+                if (_swapchainReadbackPending)
+                {
+                    TraceSwapchainReadback();
+                }
             }
 
             CollectCompletedGuestSubmissions(waitForOldest: false);
@@ -13980,21 +14055,24 @@ internal static unsafe class VulkanVideoPresenter
             switch (image.Format)
             {
                 case Format.A2B10G10R10UnormPack32:
-                    // GPU readback stores the 32-bit texel big-endian (center
-                    // 030C30C0 is 0x030C30C0, not LE 0xC0300C03). Vulkan
-                    // A2B10G10R10 has R in the least significant 10 bits.
+                    // Readback bytes are BE texels (center 030C30C0 → 0x030C30C0).
+                    // LE decode yields 010101FF at center; LE full-frame was teal
+                    // noise (boot-verify1). Match GPU packed shader: BE unpack,
+                    // then force opaque alpha for UNORM scanout.
                     ConvertPacked10GuestImageRaw(
                         raw,
                         VideoOutExports.SceVideoOutPixelFormat2R10G10B10A2,
                         bgra,
-                        bigEndian: true);
+                        bigEndian: true,
+                        forceOpaqueAlpha: true);
                     return bgra;
                 case Format.A2R10G10B10UnormPack32:
                     ConvertPacked10GuestImageRaw(
                         raw,
                         VideoOutExports.SceVideoOutPixelFormat2B10G10R10A2,
                         bgra,
-                        bigEndian: true);
+                        bigEndian: true,
+                        forceOpaqueAlpha: true);
                     return bgra;
                 case Format.R8G8B8A8Unorm or
                      Format.R8G8B8A8Srgb or
@@ -14023,7 +14101,8 @@ internal static unsafe class VulkanVideoPresenter
             ReadOnlySpan<byte> raw,
             ulong pixelFormat,
             byte[] bgra,
-            bool bigEndian = false)
+            bool bigEndian = false,
+            bool forceOpaqueAlpha = false)
         {
             Span<byte> rgba = stackalloc byte[4];
             for (var offset = 0; offset + 4 <= raw.Length; offset += 4)
@@ -14040,7 +14119,7 @@ internal static unsafe class VulkanVideoPresenter
                 bgra[destinationOffset] = rgba[2];
                 bgra[destinationOffset + 1] = rgba[1];
                 bgra[destinationOffset + 2] = rgba[0];
-                bgra[destinationOffset + 3] = rgba[3];
+                bgra[destinationOffset + 3] = forceOpaqueAlpha ? (byte)255 : rgba[3];
             }
         }
 
@@ -15872,8 +15951,15 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
-        private void RecordUpload(uint imageIndex)
+        private void RecordUpload(uint imageIndex, int frameSlot, bool traceDestination = false)
         {
+            if (_presentStagingBuffers.Length <= frameSlot)
+            {
+                throw new InvalidOperationException(
+                    "Present staging buffer is unavailable for upload.");
+            }
+
+            var stagingBuffer = _presentStagingBuffers[frameSlot];
             var oldLayout = _imageInitialized[imageIndex]
                 ? ImageLayout.PresentSrcKhr
                 : ImageLayout.Undefined;
@@ -15914,7 +16000,7 @@ internal static unsafe class VulkanVideoPresenter
             };
             _vk.CmdCopyBufferToImage(
                 _commandBuffer,
-                _stagingBuffer,
+                stagingBuffer,
                 _swapchainImages[imageIndex],
                 ImageLayout.TransferDstOptimal,
                 1,
@@ -15943,6 +16029,76 @@ internal static unsafe class VulkanVideoPresenter
                 null,
                 1,
                 &toPresent);
+
+            if (traceDestination)
+            {
+                var destinationToReadback = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.TransferReadBit,
+                    OldLayout = ImageLayout.PresentSrcKhr,
+                    NewLayout = ImageLayout.TransferSrcOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = _swapchainImages[imageIndex],
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &destinationToReadback);
+
+                var readbackRegion = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers
+                    {
+                        AspectMask = ImageAspectFlags.ColorBit,
+                        LayerCount = 1,
+                    },
+                    ImageExtent = new Extent3D(_extent.Width, _extent.Height, 1),
+                };
+                _vk.CmdCopyImageToBuffer(
+                    _commandBuffer,
+                    _swapchainImages[imageIndex],
+                    ImageLayout.TransferSrcOptimal,
+                    stagingBuffer,
+                    1,
+                    &readbackRegion);
+                _swapchainReadbackPending = true;
+                _swapchainReadbackFrameSlot = frameSlot;
+
+                var destinationBackToPresent = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferReadBit,
+                    DstAccessMask = AccessFlags.MemoryReadBit,
+                    OldLayout = ImageLayout.TransferSrcOptimal,
+                    NewLayout = ImageLayout.PresentSrcKhr,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = _swapchainImages[imageIndex],
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.BottomOfPipeBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &destinationBackToPresent);
+            }
         }
 
         // PS5 float VideoOut buffers (A16B16G16R16F flips) hold linear scRGB
@@ -16101,20 +16257,11 @@ internal static unsafe class VulkanVideoPresenter
                 source is Format.A2B10G10R10UnormPack32 or
                     Format.A2R10G10B10UnormPack32);
 
-        private static (ulong Address, ulong ContentTimeline) PackedPresentCacheKey(
-            GuestImageResource image) =>
-            (image.Address,
-                image.ContentWriteTimeline != 0
-                    ? image.ContentWriteTimeline
-                    : image.LastWriteTimeline);
-
         private bool TryGetCachedPackedPresentBgra(
             GuestImageResource image,
             out byte[] pixels)
         {
-            if (_cachedPackedPresentBgraByImage.TryGetValue(
-                    PackedPresentCacheKey(image),
-                    out var cached) &&
+            if (_cachedPackedPresentBgraByAddress.TryGetValue(image.Address, out var cached) &&
                 cached.Length > 0)
             {
                 pixels = cached;
@@ -16139,14 +16286,14 @@ internal static unsafe class VulkanVideoPresenter
                 return false;
             }
 
-            _cachedPackedPresentBgraByImage[PackedPresentCacheKey(image)] = pixels;
+            _cachedPackedPresentBgraByAddress[image.Address] = pixels;
 
-            // Bound growth: Astro Bot double-buffers, a few RT variants is enough.
-            if (_cachedPackedPresentBgraByImage.Count > 8)
+            // Bound growth: Astro Bot double-buffers; keep a few scanout slots.
+            if (_cachedPackedPresentBgraByAddress.Count > 8)
             {
-                foreach (var stale in _cachedPackedPresentBgraByImage.Keys.Take(4).ToArray())
+                foreach (var stale in _cachedPackedPresentBgraByAddress.Keys.Take(4).ToArray())
                 {
-                    _cachedPackedPresentBgraByImage.Remove(stale);
+                    _cachedPackedPresentBgraByAddress.Remove(stale);
                 }
             }
 
