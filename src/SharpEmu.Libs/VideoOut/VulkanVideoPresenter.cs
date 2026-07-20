@@ -3327,6 +3327,7 @@ internal static unsafe class VulkanVideoPresenter
             public ulong CpuContentFingerprint;
             public bool SupportsStorageUsage;
             public ImageLayout Layout = ImageLayout.Undefined;
+            public ulong LastWriteTimeline;
         }
 
         private sealed record PendingGuestSubmission(
@@ -4917,6 +4918,7 @@ internal static unsafe class VulkanVideoPresenter
         private int _batchDrawCount;
         private readonly List<TranslatedDrawResources> _batchResources = new();
         private readonly List<GuestImageResource> _batchTraceImages = new();
+        private readonly List<GuestImageResource> _batchWriteTargets = new();
 
         // Consecutive draws into the same target stay inside one render pass:
         // on MoltenVK every render pass is a Metal render encoder, and one
@@ -4998,7 +5000,8 @@ internal static unsafe class VulkanVideoPresenter
                     _batchCommandBuffer,
                     _batchResources.ToArray(),
                     _batchTraceImages.ToArray(),
-                    _batchRetireBuffers.Count > 0 ? _batchRetireBuffers.ToArray() : []);
+                    _batchRetireBuffers.Count > 0 ? _batchRetireBuffers.ToArray() : [],
+                    writeImages: _batchWriteTargets.ToArray());
             }
             catch
             {
@@ -5023,6 +5026,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 _batchResources.Clear();
                 _batchTraceImages.Clear();
+                _batchWriteTargets.Clear();
                 _batchRetireBuffers.Clear();
                 _batchCommandBuffer = default;
             }
@@ -5033,7 +5037,8 @@ internal static unsafe class VulkanVideoPresenter
             IReadOnlyList<TranslatedDrawResources> resources,
             IReadOnlyList<GuestImageResource> traceImages,
             IReadOnlyList<(VkBuffer Buffer, DeviceMemory Memory)>? retireBuffers = null,
-            IReadOnlyList<TranslatedDrawResources>? referencedResources = null)
+            IReadOnlyList<TranslatedDrawResources>? referencedResources = null,
+            IReadOnlyList<GuestImageResource>? writeImages = null)
         {
             var fence = AcquireGuestFence();
             try
@@ -5055,8 +5060,24 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             _submitTimeline++;
+            StampGuestImageLastWriteTimelines(traceImages);
+            if (writeImages is not null)
+            {
+                StampGuestImageLastWriteTimelines(writeImages);
+            }
+
             foreach (var referenced in referencedResources ?? resources)
             {
+                foreach (var texture in referenced.Textures)
+                {
+                    if (texture?.GuestImage is { } guestImage && texture.IsStorage)
+                    {
+                        guestImage.LastWriteTimeline = Math.Max(
+                            guestImage.LastWriteTimeline,
+                            _submitTimeline);
+                    }
+                }
+
                 foreach (var globalBuffer in referenced.GlobalMemoryBuffers)
                 {
                     if (globalBuffer.Allocation is not { } allocation)
@@ -5441,6 +5462,52 @@ internal static unsafe class VulkanVideoPresenter
             CollectCompletedGuestSubmissions(waitForOldest: false);
         }
 
+        private void StampGuestImageLastWriteTimelines(
+            IReadOnlyList<GuestImageResource> images)
+        {
+            foreach (var image in images)
+            {
+                image.LastWriteTimeline = Math.Max(
+                    image.LastWriteTimeline,
+                    _submitTimeline);
+            }
+        }
+
+        private void WaitForGuestImageLastWrite(GuestImageResource image)
+        {
+            FlushBatchedGuestCommands();
+            CollectCompletedGuestSubmissions(waitForOldest: false);
+
+            var targetTimeline = image.LastWriteTimeline;
+            if (targetTimeline <= _completedTimeline)
+            {
+                return;
+            }
+
+            PendingGuestSubmission? target = null;
+            foreach (var submission in _pendingGuestSubmissions)
+            {
+                if (submission.Timeline == targetTimeline)
+                {
+                    target = submission;
+                    break;
+                }
+            }
+
+            if (target is null)
+            {
+                throw new InvalidOperationException(
+                    $"Guest image 0x{image.Address:X16} lost pending timeline " +
+                    $"{targetTimeline} (completed={_completedTimeline}).");
+            }
+
+            var fence = target.Fence;
+            Check(
+                _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
+                $"vkWaitForFences(image visibility: 0x{image.Address:X16})");
+            CollectCompletedGuestSubmissions(waitForOldest: false);
+        }
+
         private bool TryExecuteOrderedGuestAction(VulkanOrderedGuestAction work)
         {
             if (!TryMakeActiveGuestQueueSubmissionsCpuVisible())
@@ -5594,7 +5661,7 @@ internal static unsafe class VulkanVideoPresenter
                 Check(
                     _vk.EndCommandBuffer(commandBuffer),
                     "vkEndCommandBuffer(flip capture)");
-                SubmitGuestCommandBuffer(commandBuffer, [], []);
+                SubmitGuestCommandBuffer(commandBuffer, [], [], writeImages: [snapshot]);
                 submitted = true;
                 snapshot.Initialized = true;
                 _guestImageVersions.Add(work.Version, snapshot);
@@ -11298,6 +11365,7 @@ internal static unsafe class VulkanVideoPresenter
 
                 var traceImages = GetTraceImages(resources, targets, work.ShaderAddress);
                 _batchTraceImages.AddRange(traceImages);
+                _batchWriteTargets.AddRange(targets);
                 if (++_batchDrawCount >= 64 ||
                     (_traceGuestImageShaderFilterEnabled && traceImages.Count != 0))
                 {
@@ -13171,16 +13239,15 @@ internal static unsafe class VulkanVideoPresenter
                         $"addr=0x{presentedGuestImage.Address:X16}");
                 }
 
-                // Default A2B10/A2R10 present uses the fullscreen sample shader
-                // (NeedsShaderPresent). CPU packed10 convert is opt-in only —
-                // SHARPEMU_FORCE_CPU_PACKED_PRESENT=1 — because QueueWaitIdle +
-                // full 4K convert previously stalled at ~0.2 FPS.
+                // Default A2B10/A2R10 present uses the CPU packed10 convert path.
+                // SHARPEMU_FORCE_GPU_PACKED_PRESENT=1 opts into the fullscreen
+                // sample shader instead.
                 if (pixels is null &&
-                    _forceCpuPackedPresent &&
+                    !_forceGpuPackedPresent &&
                     NeedsCpuPackedPresent(presentedGuestImage.Format))
                 {
                     FlushBatchedGuestCommands();
-                    WaitForAllGuestSubmissions();
+                    WaitForGuestImageLastWrite(presentedGuestImage);
                     WaitAllFrameSlots();
                     if (!_deviceLost &&
                         TryGetOrConvertPackedPresentBgra(
@@ -13225,7 +13292,7 @@ internal static unsafe class VulkanVideoPresenter
                         $"format={presentedGuestImage.Format} " +
                         $"layout={presentedGuestImage.Layout} " +
                         $"addr=0x{presentedGuestImage.Address:X16} " +
-                        $"force_cpu_packed={_forceCpuPackedPresent}");
+                        $"force_gpu_packed={_forceGpuPackedPresent}");
                 }
             }
 
@@ -13261,7 +13328,7 @@ internal static unsafe class VulkanVideoPresenter
             var guestReadbackPresent =
                 pixels is not null &&
                 presentedGuestImage is not null &&
-                _forceCpuPackedPresent &&
+                !_forceGpuPackedPresent &&
                 NeedsCpuPackedPresent(presentedGuestImage.Format);
 
             uint imageIndex;
@@ -13360,7 +13427,7 @@ internal static unsafe class VulkanVideoPresenter
                 // Same-queue barriers alone still raced to a cleared gray
                 // frame (F05EB8) and ErrorDeviceLost on the next submit.
                 FlushBatchedGuestCommands();
-                WaitForAllGuestSubmissions();
+                WaitForGuestImageLastWrite(presentedGuestImage);
                 RecordGuestImageBlit(imageIndex, presentedGuestImage);
                 waitStage = NeedsShaderPresent(presentedGuestImage.Format, _swapchainFormat)
                     ? PipelineStageFlags.ColorAttachmentOutputBit
@@ -15343,10 +15410,10 @@ internal static unsafe class VulkanVideoPresenter
             !string.IsNullOrWhiteSpace(
                 Environment.GetEnvironmentVariable(
                     "SHARPEMU_TRACE_GUEST_IMAGE_ADDRS"));
-        // Escape hatch: force the proven-but-slow CPU A2B10→BGRA present path.
-        // Default is the fullscreen sample shader (see NeedsShaderPresent).
-        private static readonly bool _forceCpuPackedPresent =
-            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_CPU_PACKED_PRESENT") == "1";
+        // Escape hatch: force the fullscreen sample shader for A2B10/A2R10.
+        // Default is the CPU packed10 convert path (see NeedsCpuPackedPresent).
+        private static readonly bool _forceGpuPackedPresent =
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_GPU_PACKED_PRESENT") == "1";
         private static readonly bool _forceFullscreenPipeline =
             Environment.GetEnvironmentVariable("SHARPEMU_FORCE_FULLSCREEN_PIPELINE") == "1";
         private static readonly bool _forceFullscreenVertex =
@@ -16001,19 +16068,21 @@ internal static unsafe class VulkanVideoPresenter
             _guestPresentDescriptorSet = default;
         }
 
-        // Packed10 formats used by the opt-in CPU present escape hatch.
+        // Packed10 formats presented via the default CPU convert path.
         private static bool NeedsCpuPackedPresent(Format source) =>
             source is Format.A2B10G10R10UnormPack32 or
                 Format.A2R10G10B10UnormPack32;
 
-        // A2B10/A2R10 and linear float / Ufloat sources present via the
-        // fullscreen sample shader. Numeric UNORM blit of float sources looks
-        // near-black; packed10 blit on Astro Bot yielded cleared gray F05EB8.
-        private static bool NeedsShaderPresent(Format source, Format destination) =>
+        // Linear float / Ufloat sources, and A2B10/A2R10 when GPU packed is
+        // forced, present via the fullscreen sample shader. Numeric UNORM blit
+        // of float sources looks near-black; packed10 blit on Astro Bot yielded
+        // cleared gray F05EB8.
+        private bool NeedsShaderPresent(Format source, Format destination) =>
             IsLinearFloatPresentSource(source) ||
-            source is Format.A2B10G10R10UnormPack32 or
-                Format.A2R10G10B10UnormPack32 or
-                Format.B10G11R11UfloatPack32;
+            source is Format.B10G11R11UfloatPack32 ||
+            (_forceGpuPackedPresent &&
+                source is Format.A2B10G10R10UnormPack32 or
+                    Format.A2R10G10B10UnormPack32);
 
         private bool TryGetOrConvertPackedPresentBgra(
             GuestImageResource image,
