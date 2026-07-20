@@ -301,6 +301,45 @@ public sealed partial class DirectExecutionBackend
 			DumpPointerWindow("fault-register-r13", r13, 0x60);
 			DumpPointerWindow("fault-register-r14", r14, 0x60);
 
+			// NULL-call decoder: when the guest tried to execute at RIP=0, it came
+			// from an indirect `call` (register or memory) whose target was NULL.
+			// The return address is at host [rsp]; the `call` instruction is the one
+			// immediately preceding it. Decode it to learn which pointer was NULL.
+			if (rip == 0 && _cpuContext != null && TryReadHostQword(rsp, out ulong retAddr) && retAddr >= 0x60)
+			{
+				Console.Error.WriteLine("[LOADER][INFO]   NULL-CALL decoder: returnAddr=0x" + retAddr.ToString("X16"));
+				// Scan backwards up to 15 bytes (max x86 call len) to locate the
+				// instruction that ends exactly at retAddr.
+				ulong scanBase = retAddr > 15 ? retAddr - 15 : 0;
+				if (IcedDecoder.TryReadGuestBytes(_cpuContext.Memory, scanBase, maxLen: 15, out var callBytes))
+				{
+					ulong cursor = scanBase;
+					while (cursor < retAddr)
+					{
+						if (!IcedDecoder.TryDecode(cursor, callBytes[(int)(cursor - scanBase)..], out var insn))
+						{
+							break;
+						}
+
+						if (insn.Rip + (ulong)insn.Bytes.Length == retAddr)
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][INFO]   NULL-CALL site: 0x{insn.Rip:X16}: {insn.Text} bytes={IcedDecoder.FormatBytes(insn.Bytes)}");
+							break;
+						}
+
+						cursor += (ulong)insn.Bytes.Length;
+					}
+				}
+
+				// Which register held the (NULL) target? Report the common call
+				// targets so we can see which one is zero.
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   NULL-CALL registers: rax=0x{rax:X16} rbx=0x{rbx:X16} rcx=0x{rcx:X16} " +
+					$"rdx=0x{rdx:X16} rsi=0x{rsi:X16} rdi=0x{rdi:X16} r8=0x{r8:X16} r9=0x{r9:X16} " +
+					$"r10=0x{r10:X16} r11=0x{r11:X16} r12=0x{r12:X16} r13=0x{r13:X16} r14=0x{r14:X16} r15=0x{r15:X16}");
+			}
+
 			try
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   Frame chain (RBP walk):");
