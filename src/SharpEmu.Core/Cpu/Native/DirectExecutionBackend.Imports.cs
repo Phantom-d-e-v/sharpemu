@@ -359,7 +359,6 @@ public sealed partial class DirectExecutionBackend
 							$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564) ret=0x{num7:X16} -> 0x{cleanupStart:X16}");
 						return 0;
 					}
-					}
 					// Deterministic fallback: the exact canary function layout seen
 					// in Astro Bot (PPSA21564) is:
 					//   +0x00 cmp ... ; +0x04 jne fail ; +0x06 cleanup-start
@@ -367,16 +366,16 @@ public sealed partial class DirectExecutionBackend
 					// So ud2 (num7) - 0x16 == cleanup-start. Use it when the byte
 					// scan above couldn't locate a jne (e.g. rare spacing).
 					if (num7 > 0x16 &&
-					R8(num7 - 0x1C, out var j0) && j0 == 0x48 &&           // cmp rsp-based preamble
-					R8(num7 - 0x18, out var j1) && j1 == 0x3B &&           // cmp
-					R8(num7 - 0x14, out var j2) && j2 == 0x75)             // jne rel8
+						R8(num7 - 0x1C, out var j0) && j0 == 0x48 &&           // cmp rsp-based preamble
+						R8(num7 - 0x18, out var j1) && j1 == 0x3B &&           // cmp
+						R8(num7 - 0x14, out var j2) && j2 == 0x75)             // jne rel8
 					{
-					ulong cleanupStart = num7 - 0x16;
-					*(ulong*)(argPackPtr + 96) = cleanupStart;
-					cpuContext[CpuRegister.Rax] = 0;
-					Console.Error.WriteLine(
-						$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564, fallback) ret=0x{num7:X16} -> 0x{cleanupStart:X16}");
-					return 0;
+						ulong cleanupStart = num7 - 0x16;
+						*(ulong*)(argPackPtr + 96) = cleanupStart;
+						cpuContext[CpuRegister.Rax] = 0;
+						Console.Error.WriteLine(
+							$" [LOADER][WARN] Recovered guest stack-check epilogue (PPSA21564, fallback) ret=0x{num7:X16} -> 0x{cleanupStart:X16}");
+						return 0;
 					}
 				}
 			}
