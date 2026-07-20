@@ -45,7 +45,10 @@ internal sealed record VulkanTranslatedGuestDraw(
     uint InstanceCount,
     uint PrimitiveType,
     GuestIndexBuffer? IndexBuffer,
-    GuestRenderState RenderState);
+    GuestRenderState RenderState,
+    uint FirstIndex = 0,
+    int VertexOffset = 0,
+    uint FirstInstance = 0);
 
 internal sealed record VulkanOffscreenGuestDraw(
     VulkanTranslatedGuestDraw Draw,
@@ -109,6 +112,14 @@ internal static unsafe class VulkanVideoPresenter
         PipelineStageFlags.VertexShaderBit |
         PipelineStageFlags.FragmentShaderBit |
         PipelineStageFlags.ComputeShaderBit;
+
+    // These policy helpers are intentionally independent of Vulkan so the
+    // submission-wait contract stays covered by focused unit tests.
+    internal static bool ShouldProbeGuestSubmissionCapacity(bool waitConfigured) =>
+        waitConfigured;
+
+    internal static int GetGuestSubmissionDrainFenceIndex(int pendingSubmissionCount) =>
+        pendingSubmissionCount <= 0 ? -1 : pendingSubmissionCount - 1;
 
     // Standalone CLI launches use a desktop-sized surface. The embedded GUI
     // always takes its dimensions from the native child control instead.
@@ -421,20 +432,29 @@ internal static unsafe class VulkanVideoPresenter
         ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FENCE_WAIT_TIMEOUT_MS"), out var fenceMs) && fenceMs > 0
             ? fenceMs * 1_000_000UL
             : 3_000_000_000UL;
-    // When making room in the in-flight submission queue from the macOS MAIN
-    // thread (Render() -> guest-work drain), block only this long per attempt
-    // instead of the full fence timeout. If a slow/capped compute submission
-    // isn't done yet, proceed anyway: the in-flight cap is soft, the fence and
-    // command-buffer pools are dynamic so a brief overshoot is safe, and the
-    // queue drains as GPU completions land on later frames. This keeps the
-    // window responsive (event pump runs) under a heavy compute backlog instead
-    // of the main thread sitting in vkWaitForFences for up to 3s per chunk.
-    // SHARPEMU_SUBMISSION_CAPACITY_WAIT_MS overrides; default 100ms; 0 restores
-    // the full blocking wait.
+    // The in-flight submission cap is deliberately soft: command-buffer and
+    // fence pools grow safely while the GPU works through a backlog. Waiting
+    // here is therefore only a throughput trade-off, not a correctness
+    // boundary. In particular, a 100ms probe on every over-cap submission
+    // serializes a busy Windows render thread and starves the guest-work queue.
+    // Default to a non-blocking completion poll. Set
+    // SHARPEMU_SUBMISSION_CAPACITY_WAIT_MS=N to opt into an N-ms probe; set it
+    // to 0 for the legacy full fence wait. CPU visibility paths always wait
+    // regardless of this setting.
+    private static readonly bool _submissionCapacityWaitConfigured =
+        ulong.TryParse(
+            Environment.GetEnvironmentVariable("SHARPEMU_SUBMISSION_CAPACITY_WAIT_MS"),
+            out _);
     private static readonly ulong _submissionCapacityWaitNs =
-        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SUBMISSION_CAPACITY_WAIT_MS"), out var capMs)
-            ? capMs * 1_000_000UL
-            : 100_000_000UL;
+        ulong.TryParse(
+            Environment.GetEnvironmentVariable("SHARPEMU_SUBMISSION_CAPACITY_WAIT_MS"),
+            out var configuredCapacityWaitMs)
+                ? configuredCapacityWaitMs * 1_000_000UL
+                : 0;
+    private static readonly bool _traceGuestSubmissionDiagnostics =
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_VK_SUBMISSIONS") == "1";
+    private static readonly long _guestSubmissionDiagnosticIntervalTicks =
+        5L * System.Diagnostics.Stopwatch.Frequency;
     private static readonly HashSet<string> _tracedFenceTimeouts = new();
     private static long _guestQueueBackpressureTraceCount;
     // Diagnostic: skip every compute dispatch (mistranslated compute shaders
@@ -950,7 +970,10 @@ internal static unsafe class VulkanVideoPresenter
         uint primitiveType = 4,
         GuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
-        GuestRenderState? renderState = null)
+        GuestRenderState? renderState = null,
+        uint firstIndex = 0,
+        int vertexOffset = 0,
+        uint firstInstance = 0)
     {
         if (pixelSpirv.Length == 0 || width == 0 || height == 0)
         {
@@ -982,7 +1005,10 @@ internal static unsafe class VulkanVideoPresenter
                     instanceCount,
                     primitiveType,
                     indexBuffer,
-                    renderState ?? GuestRenderState.Default),
+                    renderState ?? GuestRenderState.Default,
+                    firstIndex,
+                    vertexOffset,
+                    firstInstance),
                 RequiredGuestWorkSequence: CurrentSubmittingQueueTailLocked(),
                 IsSplash: false);
             if (_thread is not null)
@@ -1010,7 +1036,10 @@ internal static unsafe class VulkanVideoPresenter
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
         GuestDepthTarget? depthTarget = null,
-        ulong shaderAddress = 0)
+        ulong shaderAddress = 0,
+        uint firstIndex = 0,
+        int vertexOffset = 0,
+        uint firstInstance = 0)
     {
         SubmitOffscreenTranslatedDraw(
             pixelSpirv,
@@ -1026,7 +1055,10 @@ internal static unsafe class VulkanVideoPresenter
             vertexBuffers,
             renderState,
             depthTarget,
-            shaderAddress);
+            shaderAddress,
+            firstIndex,
+            vertexOffset,
+            firstInstance);
     }
 
     // Manual scans (targets are <= 8) so the per-draw validation does not
@@ -1079,7 +1111,10 @@ internal static unsafe class VulkanVideoPresenter
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
         GuestDepthTarget? depthTarget = null,
-        ulong shaderAddress = 0)
+        ulong shaderAddress = 0,
+        uint firstIndex = 0,
+        int vertexOffset = 0,
+        uint firstInstance = 0)
     {
         if (pixelSpirv.Length == 0 ||
             targets.Count == 0 ||
@@ -1146,7 +1181,10 @@ internal static unsafe class VulkanVideoPresenter
                         instanceCount,
                         primitiveType,
                         indexBuffer,
-                        effectiveRenderState),
+                        effectiveRenderState,
+                        firstIndex,
+                        vertexOffset,
+                        firstInstance),
                     targets.ToArray(),
                     depthTarget,
                     PublishTarget: true,
@@ -1171,7 +1209,10 @@ internal static unsafe class VulkanVideoPresenter
         GuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
-        ulong shaderAddress = 0)
+        ulong shaderAddress = 0,
+        uint firstIndex = 0,
+        int vertexOffset = 0,
+        uint firstInstance = 0)
     {
         if (pixelSpirv.Length == 0 ||
             depthTarget.Address == 0 ||
@@ -1201,7 +1242,10 @@ internal static unsafe class VulkanVideoPresenter
                         instanceCount,
                         primitiveType,
                         indexBuffer,
-                        renderState ?? GuestRenderState.Default),
+                        renderState ?? GuestRenderState.Default,
+                        firstIndex,
+                        vertexOffset,
+                        firstInstance),
                     [new GuestRenderTarget(
                         Address: 0,
                         depthTarget.Width,
@@ -2967,6 +3011,15 @@ internal static unsafe class VulkanVideoPresenter
         private readonly Queue<PendingGuestSubmission> _pendingGuestSubmissions = new();
         private readonly Dictionary<string, ulong> _lastSubmittedTimelineByGuestQueue =
             new(StringComparer.Ordinal);
+        // Aggregate queue/fence telemetry. It is deliberately opt-in because
+        // this hot path may submit several hundred command buffers per frame.
+        private long _guestSubmissionCount;
+        private long _guestSubmissionFenceWaitCount;
+        private long _guestSubmissionFenceWaitTicks;
+        private long _guestSubmissionCapacityPressureCount;
+        private long _guestSubmissionCapacityProbeCount;
+        private int _guestSubmissionPeakInFlight;
+        private long _lastGuestSubmissionDiagnosticTicks;
         private readonly Stack<DescriptorPool> _recycledDescriptorPools = new();
         private VulkanGuestQueueIdentity _activeGuestQueue =
             VulkanGuestQueueIdentity.Default;
@@ -3032,6 +3085,9 @@ internal static unsafe class VulkanVideoPresenter
             public bool Index32Bit;
             public uint VertexCount = 3;
             public uint InstanceCount = 1;
+            public uint FirstIndex;
+            public int VertexOffset;
+            public uint FirstInstance;
             public PrimitiveTopology Topology = PrimitiveTopology.TriangleList;
             public GuestBlendState[] Blends = [GuestBlendState.Default];
             public GuestBlendConstant BlendConstant;
@@ -4939,8 +4995,40 @@ internal static unsafe class VulkanVideoPresenter
                     resources.Count > 0 ? resources[0].DebugName : "batch",
                     _activeGuestQueue,
                     _activeGuestWorkSequence));
+            _guestSubmissionCount++;
+            _guestSubmissionPeakInFlight = Math.Max(
+                _guestSubmissionPeakInFlight,
+                _pendingGuestSubmissions.Count);
             _lastSubmittedTimelineByGuestQueue[_activeGuestQueue.Name] =
                 _submitTimeline;
+            TraceGuestSubmissionDiagnosticsIfDue();
+        }
+
+        private void TraceGuestSubmissionDiagnosticsIfDue()
+        {
+            if (!_traceGuestSubmissionDiagnostics)
+            {
+                return;
+            }
+
+            var now = Stopwatch.GetTimestamp();
+            if (now - _lastGuestSubmissionDiagnosticTicks <
+                _guestSubmissionDiagnosticIntervalTicks)
+            {
+                return;
+            }
+
+            _lastGuestSubmissionDiagnosticTicks = now;
+            var waitMs = _guestSubmissionFenceWaitTicks * 1000.0 /
+                Stopwatch.Frequency;
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] vk.submission_stats " +
+                $"submitted={_guestSubmissionCount} pending={_pendingGuestSubmissions.Count} " +
+                $"peak_pending={_guestSubmissionPeakInFlight} " +
+                $"capacity_pressure={_guestSubmissionCapacityPressureCount} " +
+                $"capacity_probes={_guestSubmissionCapacityProbeCount} " +
+                $"fence_waits={_guestSubmissionFenceWaitCount} " +
+                $"fence_wait_ms={waitMs:F2}");
         }
 
         private void TransitionNewGuestImageToSampled(Image image, uint mipLevels)
@@ -4990,23 +5078,68 @@ internal static unsafe class VulkanVideoPresenter
             CollectCompletedGuestSubmissions(waitForOldest: false);
             if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
             {
-                // Bounded wait so the macOS main thread returns to its event
-                // pump promptly under a slow-compute backlog; if the oldest
-                // isn't done yet we proceed (soft cap, dynamic pools).
-                CollectCompletedGuestSubmissions(
-                    waitForOldest: true,
-                    maxWaitNs: _submissionCapacityWaitNs == 0
-                        ? _guestFenceWaitTimeoutNs
-                        : _submissionCapacityWaitNs);
+                _guestSubmissionCapacityPressureCount++;
+                // This is a resource-management heuristic, not a guest-visible
+                // synchronization point. Defaulting to a completion poll avoids
+                // one bounded vkWaitForFences call per submission while a slow
+                // compute dispatch is ahead of the queue. Explicit CPU/guest
+                // visibility paths retain their blocking waits below.
+                if (ShouldProbeGuestSubmissionCapacity(
+                        _submissionCapacityWaitConfigured))
+                {
+                    _guestSubmissionCapacityProbeCount++;
+                    CollectCompletedGuestSubmissions(
+                        waitForOldest: true,
+                        maxWaitNs: _submissionCapacityWaitNs == 0
+                            ? _guestFenceWaitTimeoutNs
+                            : _submissionCapacityWaitNs);
+                }
+
+                TraceGuestSubmissionDiagnosticsIfDue();
             }
         }
 
         private void WaitForAllGuestSubmissions()
         {
-            while (_pendingGuestSubmissions.Count != 0)
+            if (_pendingGuestSubmissions.Count == 0)
             {
-                CollectCompletedGuestSubmissions(waitForOldest: true);
+                return;
             }
+
+            // Every guest submission uses _queue, whose fences signal in
+            // submission order. Waiting for the newest fence therefore proves
+            // every earlier command buffer is complete and replaces an
+            // unnecessary N-fence serial drain with one wait.
+            PendingGuestSubmission? newest = null;
+            var newestIndex = GetGuestSubmissionDrainFenceIndex(
+                _pendingGuestSubmissions.Count);
+            var submissionIndex = 0;
+            foreach (var submission in _pendingGuestSubmissions)
+            {
+                if (submissionIndex++ == newestIndex)
+                {
+                    newest = submission;
+                    break;
+                }
+            }
+
+            var fence = newest!.Fence;
+            var waitStart = Stopwatch.GetTimestamp();
+            var result = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
+            _guestSubmissionFenceWaitCount++;
+            _guestSubmissionFenceWaitTicks += Stopwatch.GetTimestamp() - waitStart;
+            if (result == Result.ErrorDeviceLost)
+            {
+                _deviceLost = true;
+            }
+            else
+            {
+                Check(
+                    result,
+                    $"vkWaitForFences(all guest submissions: {newest.DebugName})");
+            }
+            CollectCompletedGuestSubmissions(waitForOldest: false);
+            TraceGuestSubmissionDiagnosticsIfDue();
         }
 
         private void CollectCompletedGuestSubmissions(bool waitForOldest, ulong maxWaitNs = 0)
@@ -5021,12 +5154,15 @@ internal static unsafe class VulkanVideoPresenter
                 // finishes it on a later frame.
                 var isProbeWait = maxWaitNs != 0 && maxWaitNs < _guestFenceWaitTimeoutNs;
                 var waitNs = maxWaitNs != 0 ? maxWaitNs : _guestFenceWaitTimeoutNs;
+                var waitStart = Stopwatch.GetTimestamp();
                 var result = _vk.WaitForFences(
                     _device,
                     1,
                     &fence,
                     true,
                     waitNs);
+                _guestSubmissionFenceWaitCount++;
+                _guestSubmissionFenceWaitTicks += Stopwatch.GetTimestamp() - waitStart;
                 if (result == Result.Timeout)
                 {
                     // A GPU submission whose fence never signals (typically a
@@ -5109,19 +5245,16 @@ internal static unsafe class VulkanVideoPresenter
         private void WaitForAllGuestSubmissionsForCpuVisibility()
         {
             FlushBatchedGuestCommands();
-            while (_pendingGuestSubmissions.TryPeek(out var oldest))
-            {
-                var fence = oldest.Fence;
-                Check(
-                    _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
-                    $"vkWaitForFences(cpu visibility: {oldest.DebugName})");
-                CollectCompletedGuestSubmissions(waitForOldest: false);
-            }
+            WaitForAllGuestSubmissions();
         }
 
         private bool TryMakeActiveGuestQueueSubmissionsCpuVisible()
         {
             FlushBatchedGuestCommands();
+            // Reclaim already-signalled fences before looking up a timeline.
+            // This avoids an otherwise redundant status query at every ordered
+            // guest action after the GPU has caught up.
+            CollectCompletedGuestSubmissions(waitForOldest: false);
             if (!_lastSubmittedTimelineByGuestQueue.TryGetValue(
                     _activeGuestQueue.Name,
                     out var targetTimeline) ||
@@ -5180,6 +5313,8 @@ internal static unsafe class VulkanVideoPresenter
             {
                 FlushBatchedGuestCommands();
             }
+
+            CollectCompletedGuestSubmissions(waitForOldest: false);
 
             var targetTimeline = allocation.LastUseTimeline;
             if (targetTimeline <= _completedTimeline)
@@ -6028,7 +6163,10 @@ internal static unsafe class VulkanVideoPresenter
                     new GlobalBufferResource[draw.GlobalMemoryBuffers.Count],
                 VertexBuffers = new VertexBufferResource[draw.VertexBuffers.Count],
                 VertexCount = GetDrawVertexCount(draw.PrimitiveType, draw.VertexCount, draw.IndexBuffer),
-                InstanceCount = Math.Max(draw.InstanceCount, 1),
+                InstanceCount = draw.InstanceCount,
+                FirstIndex = draw.FirstIndex,
+                VertexOffset = draw.VertexOffset,
+                FirstInstance = draw.FirstInstance,
                 Topology = GetPrimitiveTopology(draw.PrimitiveType),
                 Blends = draw.RenderState.Blends.ToArray(),
                 BlendConstant = draw.RenderState.BlendConstant,
@@ -14561,9 +14699,9 @@ internal static unsafe class VulkanVideoPresenter
                         _commandBuffer,
                         resources.VertexCount,
                         resources.InstanceCount,
-                        0,
-                        0,
-                        0);
+                        resources.FirstIndex,
+                        resources.VertexOffset,
+                        resources.FirstInstance);
                 }
                 else
                 {
@@ -14571,8 +14709,8 @@ internal static unsafe class VulkanVideoPresenter
                         _commandBuffer,
                         resources.VertexCount,
                         resources.InstanceCount,
-                        0,
-                        0);
+                        unchecked((uint)resources.VertexOffset),
+                        resources.FirstInstance);
                 }
 
                 drawCount++;

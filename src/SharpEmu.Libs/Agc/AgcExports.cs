@@ -436,6 +436,9 @@ public static partial class AgcExports
         uint AttributeCount,
         uint VertexCount,
         uint InstanceCount,
+        uint FirstIndex,
+        int VertexOffset,
+        uint FirstInstance,
         GuestIndexBuffer? IndexBuffer,
         IReadOnlyList<TranslatedImageBinding> Textures,
         IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
@@ -554,6 +557,8 @@ public static partial class AgcExports
         public uint IndexSize { get; set; }
         public uint InstanceCount { get; set; } = 1;
         public uint DrawIndexOffset { get; set; }
+        public int DrawVertexOffset { get; set; }
+        public uint FirstInstance { get; set; }
         public string QueueName { get; set; } = "graphics";
         public ulong ActiveSubmissionId { get; set; }
         public Queue<PendingSubmission> PendingSubmissions { get; } = new();
@@ -3436,7 +3441,10 @@ public static partial class AgcExports
                         vertexBuffers,
                         pendingComposite.RenderState,
                         pendingComposite.DepthTarget,
-                        pendingComposite.PixelShaderAddress);
+                        pendingComposite.PixelShaderAddress,
+                        pendingComposite.FirstIndex,
+                        pendingComposite.VertexOffset,
+                        pendingComposite.FirstInstance);
                     TraceAgcShader(
                         $"agc.deferred_composite ps=0x{pendingComposite.PixelShaderAddress:X16} " +
                         $"src=0x{pendingComposite.Textures.FirstOrDefault()?.Descriptor.Address ?? 0:X16} " +
@@ -3485,7 +3493,10 @@ public static partial class AgcExports
                         globalMemoryBuffers,
                         translatedDisplayBuffer.Width,
                         translatedDisplayBuffer.Height,
-                        translatedDraw.AttributeCount);
+                        translatedDraw.AttributeCount,
+                        firstIndex: translatedDraw.FirstIndex,
+                        vertexOffset: translatedDraw.VertexOffset,
+                        firstInstance: translatedDraw.FirstInstance);
                     TraceAgcShader(
                         $"agc.shader_present ps=0x{translatedDraw.PixelShaderAddress:X16} " +
                         $"spirv={translatedDraw.PixelShader.Payload.Length} textures={textures.Count} " +
@@ -4041,6 +4052,8 @@ public static partial class AgcExports
         state.IndexSize = 0;
         state.InstanceCount = 1;
         state.DrawIndexOffset = 0;
+        state.DrawVertexOffset = 0;
+        state.FirstInstance = 0;
     }
 
     private static bool RangesOverlap(
@@ -5402,9 +5415,14 @@ public static partial class AgcExports
         switch (op)
         {
             case ItDrawIndexAuto when packetLength >= 3:
+                state.DrawIndexOffset = 0;
+                state.DrawVertexOffset = 0;
+                state.FirstInstance = 0;
                 return TryReadUInt32(ctx, packetAddress + 4, out drawCount);
             case ItDrawIndex2 when packetLength >= 6:
                 state.DrawIndexOffset = 0;
+                state.DrawVertexOffset = 0;
+                state.FirstInstance = 0;
                 return TryReadUInt32(ctx, packetAddress + 16, out drawCount);
             case ItDrawIndexOffset2 when packetLength >= 5:
                 if (!TryReadUInt32(ctx, packetAddress + 8, out var indexOffset))
@@ -5413,6 +5431,8 @@ public static partial class AgcExports
                 }
 
                 state.DrawIndexOffset = indexOffset;
+                state.DrawVertexOffset = 0;
+                state.FirstInstance = 0;
                 return TryReadUInt32(ctx, packetAddress + 12, out drawCount);
             case ItDrawIndexMultiAuto when packetLength >= 4:
                 if (!TryReadUInt32(ctx, packetAddress + 12, out var control))
@@ -5430,10 +5450,19 @@ public static partial class AgcExports
                 }
 
                 var argumentsAddress = state.IndirectArgsAddress + dataOffset;
-                if (!TryReadUInt32(ctx, argumentsAddress, out drawCount))
+                if (!TryReadUInt32(ctx, argumentsAddress, out drawCount) ||
+                    !TryReadUInt32(ctx, argumentsAddress + 4, out var indirectInstanceCount) ||
+                    !TryReadUInt32(ctx, argumentsAddress + 8, out var firstIndex) ||
+                    !TryReadUInt32(ctx, argumentsAddress + 12, out var rawVertexOffset) ||
+                    !TryReadUInt32(ctx, argumentsAddress + 16, out var firstInstance))
                 {
                     return false;
                 }
+
+                state.InstanceCount = indirectInstanceCount;
+                state.DrawIndexOffset = op == ItDrawIndexIndirect ? firstIndex : 0;
+                state.DrawVertexOffset = unchecked((int)rawVertexOffset);
+                state.FirstInstance = firstInstance;
 
                 if (_traceAgcShader &&
                     TryReadUInt32(ctx, argumentsAddress + 4, out var argument1) &&
@@ -5446,22 +5475,6 @@ public static partial class AgcExports
                         $"addr=0x{argumentsAddress:X16} " +
                         $"raw={drawCount:X8}/{argument1:X8}/{argument2:X8}/" +
                         $"{argument3:X8}/{argument4:X8}");
-                }
-
-                // DRAW(_INDEX)_INDIRECT stores the per-draw instance count in
-                // the second argument dword. Keeping the previous NUM_INSTANCES
-                // register value collapses GPU-generated instanced draws to one
-                // instance (Astro Bot emits indexCount=1, instanceCount=512).
-                if (TryReadUInt32(ctx, argumentsAddress + 4, out var indirectInstanceCount))
-                {
-                    state.InstanceCount = indirectInstanceCount;
-                }
-
-                // Indexed indirect arguments place firstIndex in dword 2.
-                if (op == ItDrawIndexIndirect &&
-                    TryReadUInt32(ctx, argumentsAddress + 8, out var firstIndex))
-                {
-                    state.DrawIndexOffset = firstIndex;
                 }
 
                 return true;
@@ -5596,7 +5609,10 @@ public static partial class AgcExports
                 depthOnlyDraw.IndexBuffer,
                 vertexBuffers,
                 renderState,
-                depthOnlyDraw.PixelShaderAddress);
+                depthOnlyDraw.PixelShaderAddress,
+                depthOnlyDraw.FirstIndex,
+                depthOnlyDraw.VertexOffset,
+                depthOnlyDraw.FirstInstance);
 
             if (_traceAgcShader)
             {
@@ -5741,7 +5757,10 @@ public static partial class AgcExports
                     sharedVertexBuffers,
                     translatedDraw.RenderState,
                     translatedDraw.DepthTarget,
-                    translatedDraw.PixelShaderAddress);
+                    translatedDraw.PixelShaderAddress,
+                    translatedDraw.FirstIndex,
+                    translatedDraw.VertexOffset,
+                    translatedDraw.FirstInstance);
             }
             else
             {
@@ -5782,7 +5801,10 @@ public static partial class AgcExports
                         translatedDraw.IndexBuffer,
                         vertexBuffers,
                         renderState,
-                        translatedDraw.PixelShaderAddress);
+                        translatedDraw.PixelShaderAddress,
+                        translatedDraw.FirstIndex,
+                        translatedDraw.VertexOffset,
+                        translatedDraw.FirstInstance);
                 }
                 else
                 {
@@ -6084,6 +6106,9 @@ public static partial class AgcExports
             AttributeCount: 0,
             vertexCount,
             state.InstanceCount,
+            state.DrawIndexOffset,
+            state.DrawVertexOffset,
+            state.FirstInstance,
             indexed ? CreateGuestIndexBuffer(ctx, state, vertexCount) : null,
             textures,
             exportEvaluation.GlobalMemoryBindings,
@@ -6413,6 +6438,9 @@ public static partial class AgcExports
             GetInterpolatedAttributeCount(pixelState),
             vertexCount,
             state.InstanceCount,
+            state.DrawIndexOffset,
+            state.DrawVertexOffset,
+            state.FirstInstance,
             indexed ? CreateGuestIndexBuffer(ctx, state, vertexCount) : null,
             textures,
             globalMemoryBindings,
@@ -6617,11 +6645,14 @@ public static partial class AgcExports
 
         var is32Bit = state.IndexSize != 0;
         var bytesPerIndex = is32Bit ? sizeof(uint) : sizeof(ushort);
-        var byteOffset = checked((ulong)state.DrawIndexOffset * (uint)bytesPerIndex);
-        var byteCount = checked((int)(indexCount * (uint)bytesPerIndex));
+        // Keep the original index-buffer base in the upload. The native draw
+        // command consumes FirstIndex, so slicing the payload here would lose
+        // the guest command's indexed-draw semantics at the Vulkan/Metal seam.
+        var uploadIndexCount = checked(state.DrawIndexOffset + indexCount);
+        var byteCount = checked((int)(uploadIndexCount * (uint)bytesPerIndex));
         var data = GuestDataPool.Shared.Rent(byteCount);
         var span = data.AsSpan(0, byteCount);
-        var address = state.IndexBufferAddress + byteOffset;
+        var address = state.IndexBufferAddress;
         if (ctx.Memory.TryRead(address, span) ||
             KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, span))
         {

@@ -86,7 +86,10 @@ internal static partial class MetalVideoPresenter
         uint InstanceCount,
         uint PrimitiveType,
         GuestIndexBuffer? IndexBuffer,
-        GuestRenderState RenderState);
+        GuestRenderState RenderState,
+        uint FirstIndex = 0,
+        int VertexOffset = 0,
+        uint FirstInstance = 0);
 
     private sealed record OffscreenGuestDraw(
         TranslatedGuestDraw Draw,
@@ -147,7 +150,10 @@ internal static partial class MetalVideoPresenter
         uint primitiveType,
         GuestIndexBuffer? indexBuffer,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers,
-        GuestRenderState? renderState)
+        GuestRenderState? renderState,
+        uint firstIndex = 0,
+        int vertexOffset = 0,
+        uint firstInstance = 0)
     {
         if (width == 0 || height == 0)
         {
@@ -180,7 +186,10 @@ internal static partial class MetalVideoPresenter
                     instanceCount,
                     primitiveType,
                     indexBuffer,
-                    renderState ?? GuestRenderState.Default));
+                    renderState ?? GuestRenderState.Default,
+                    firstIndex,
+                    vertexOffset,
+                    firstInstance));
             if (_thread is not null)
             {
                 return;
@@ -244,7 +253,10 @@ internal static partial class MetalVideoPresenter
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers,
         GuestRenderState? renderState,
         GuestDepthTarget? depthTarget,
-        ulong shaderAddress)
+        ulong shaderAddress,
+        uint firstIndex = 0,
+        int vertexOffset = 0,
+        uint firstInstance = 0)
     {
         if (targets.Count == 0)
         {
@@ -292,7 +304,10 @@ internal static partial class MetalVideoPresenter
                         instanceCount,
                         primitiveType,
                         indexBuffer,
-                        effectiveRenderState),
+                        effectiveRenderState,
+                        firstIndex,
+                        vertexOffset,
+                        firstInstance),
                     ToArray(targets),
                     depthTarget,
                     PublishTarget: true,
@@ -320,7 +335,10 @@ internal static partial class MetalVideoPresenter
         GuestIndexBuffer? indexBuffer,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers,
         GuestRenderState? renderState,
-        ulong shaderAddress)
+        ulong shaderAddress,
+        uint firstIndex = 0,
+        int vertexOffset = 0,
+        uint firstInstance = 0)
     {
         if (depthTarget.Address == 0 || depthTarget.Width == 0 || depthTarget.Height == 0)
         {
@@ -347,7 +365,10 @@ internal static partial class MetalVideoPresenter
                         instanceCount,
                         primitiveType,
                         indexBuffer,
-                        renderState ?? GuestRenderState.Default),
+                        renderState ?? GuestRenderState.Default,
+                        firstIndex,
+                        vertexOffset,
+                        firstInstance),
                     [new GuestRenderTarget(Address: 0, depthTarget.Width, depthTarget.Height, Format: 10, NumberType: 0)],
                     depthTarget,
                     PublishTarget: false,
