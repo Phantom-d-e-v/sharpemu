@@ -370,7 +370,7 @@ public sealed partial class DirectExecutionBackend
 						R8(num7 - 0x18, out var j1) && j1 == 0x3B &&           // cmp
 						R8(num7 - 0x14, out var j2) && j2 == 0x75)             // jne rel8
 					{
-						ulong cleanupStart = num7 - 0x16;
+						cleanupStart = num7 - 0x16;
 						*(ulong*)(argPackPtr + 96) = cleanupStart;
 						cpuContext[CpuRegister.Rax] = 0;
 						Console.Error.WriteLine(
