@@ -1272,42 +1272,32 @@ public static class KernelRuntimeCompatExports
             {
                 if (ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var retAddr))
                 {
-                    // DIAGNOSTIC (PPSA21564): dump 0x100 bytes immediately
-                    // BEFORE the ud2 cold-path (retAddr) so we can read the real
-                    // epilogue (mov rax,rdi / add rsp / pop* / ret) and compute
-                    // the exact resume offset. retAddr (0x800FCB2C4) is the ud2,
-                    // NOT the function head; the real epilogue precedes it.
-                    // CpuContext only exposes TryReadUInt64, so read 8-byte
-                    // chunks and unpack each byte.
-                    var diag = new System.Text.StringBuilder();
-                    diag.Append($"[LOADER][DIAG] __stack_chk_fail pre-ud2 @0x{retAddr - 0x100uL:X16}: ");
-                    for (var c = 0; c < 0x20; c++)
+                    // PPSA21564 (Astro Bot) canary recovery. The HLE import
+                    // bridge enters this export with [RSP] already set to the
+                    // function's canary-check site (0x800FCB2C4). The dumped
+                    // function layout (verified from guest bytes) is:
+                    //   0x...2C4: 48 3B 45 D0        cmp rbp, rsp
+                    //   0x...2C8: 75 15              jne <fail>  (neutralized -> 90 90)
+                    //   0x...2CA: 48 89 F8           mov rax, rdi   <-- resume here
+                    //   0x...2CD: 48 81 C4 48 1E.. add rsp, 0x1E48
+                    //   0x...2D4: 5B 41 5C ...       pop rbx..r15, pop rbp
+                    //   0x...2DE: C3                 ret
+                    //   0x...2DF: E8 ....            call __stack_chk_fail (ud2 cold path)
+                    //   0x...2E4: 0F 0B             ud2
+                    // Resuming at the `mov rax,rdi` (+6 from the check site)
+                    // runs the now-valid epilogue: RAX = RDI (the ctx ptr the
+                    // caller expects), tears down the frame, and RETs cleanly to
+                    // the caller. RAX is pre-set to RDI for safety. This skips
+                    // the ud2 cold path entirely. The backend resumes guest
+                    // execution at whatever [RSP] holds on export return.
+                    var resume = retAddr + 0x6uL;
+                    if (ctx.TryWriteUInt64(ctx[CpuRegister.Rsp], resume))
                     {
-                        var chunkAddr = retAddr - 0x100uL + (ulong)(c * 8);
-                        if (ctx.TryReadUInt64(chunkAddr, out var chunk))
-                        {
-                            for (var j = 0; j < 8; j++)
-                                diag.Append($"{(byte)(chunk >> (8 * j)):X2} ");
-                        }
-                        else
-                        {
-                            diag.Append("?? ?? ?? ?? ?? ?? ?? ?? ");
-                        }
+                        ctx[CpuRegister.Rax] = ctx[CpuRegister.Rdi];
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip recovered (resumed epilogue) ret=0x{retAddr:X16} -> 0x{resume:X16}");
+                        return 0;
                     }
-                    Console.Error.WriteLine(diag.ToString());
-
-                    // Astro Bot's canary-protected function: retAddr (0x800FCB2C4)
-                    // is the ud2 cold path that follows `call __stack_chk_fail`.
-                    // The real function body (cmp rbp,rsp; jne; mov rax,rdi;
-                    // add rsp,imm; pop*; ret) precedes it. We must resume at the
-                    // epilogue's first instruction (the `mov rax,rdi`/teardown),
-                    // NOT at the ud2. The exact offset is derived from the dumped
-                    // bytes above. For now we set RAX=RDI and return; the resume
-                    // offset is patched once the layout is confirmed.
-                    ctx[CpuRegister.Rax] = ctx[CpuRegister.Rdi];
-                    Console.Error.WriteLine(
-                        $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip recovered (resumed at 0x{retAddr:X16}).");
-                    return 0;
                 }
             }
             catch
