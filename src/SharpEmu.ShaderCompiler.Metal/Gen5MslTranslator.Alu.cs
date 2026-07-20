@@ -272,6 +272,8 @@ public static partial class Gen5MslTranslator
                     AsUInt($"(as_type<int>({RawSource(instruction, 1)}) >> (({RawSource(instruction, 0)}) & 31u))"),
                 "VBfeU32" =>
                     $"extract_bits({RawSource(instruction, 0)}, ({RawSource(instruction, 1)}) & 31u, ({RawSource(instruction, 2)}) & 31u)",
+                "VBfeI32" =>
+                    AsUInt($"extract_bits(as_type<int>({RawSource(instruction, 0)}), ({RawSource(instruction, 1)}) & 31u, ({RawSource(instruction, 2)}) & 31u)"),
                 "VBfiB32" =>
                     $"((({RawSource(instruction, 0)}) & ({RawSource(instruction, 1)})) | (~({RawSource(instruction, 0)}) & ({RawSource(instruction, 2)})))",
                 "VBfmB32" =>
