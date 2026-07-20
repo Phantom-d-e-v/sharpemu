@@ -14356,6 +14356,11 @@ internal static unsafe class VulkanVideoPresenter
         private static readonly bool _tracePresentedGuestImagesEnabled =
             _traceGuestImagesEnabled ||
             string.Equals(_traceGuestImagesMode, "present", StringComparison.OrdinalIgnoreCase);
+        // Read back only the final swapchain image. Unlike "present", this mode
+        // deliberately avoids synchronous readback of the source guest image so
+        // long-running frame-chain diagnostics do not perturb the render graph.
+        private static readonly bool _traceSwapchainImagesEnabled =
+            string.Equals(_traceGuestImagesMode, "swapchain", StringComparison.OrdinalIgnoreCase);
         private static readonly bool _traceVulkanResourcesEnabled =
             string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_LOG_VK_RESOURCES"),
@@ -15031,7 +15036,8 @@ internal static unsafe class VulkanVideoPresenter
             var presentedCount = Interlocked.Increment(ref _presentedSwapchainCount);
             var periodicDumpInterval = SwapchainDumpInterval();
             var traceDestination =
-                ShouldTracePresentedGuestImageContentsForDiagnostics() &&
+                (_traceSwapchainImagesEnabled ||
+                 ShouldTracePresentedGuestImageContentsForDiagnostics()) &&
                 (!_tracedPresentedSwapchain ||
                  periodicDumpInterval > 0 && presentedCount % periodicDumpInterval == 0);
             _tracedPresentedSwapchain |= traceDestination;

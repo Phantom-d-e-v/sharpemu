@@ -22,9 +22,8 @@ public static class AvPlayerExports
     private static readonly object StateGate = new();
 
     // Astro Bot (PPSA21564) has a guest AvPlayer texture allocator callback that
-    // trips a stack canary / CPU trap when invoked, freezing the emulator on the
-    // boot splash. For that title we never call the guest allocator and stop
-    // delivering video frames so the game advances to gameplay.
+    // trips a stack canary / CPU trap when invoked. Bypass that callback and use
+    // the generic HLE allocation path while continuing to deliver video frames.
     private static bool IsAvPlayerTextureAllocatorBroken()
     {
         var title = SharpEmu.Libs.SystemService.SystemServiceExports.MainAppTitleId;
@@ -152,7 +151,7 @@ public static class AvPlayerExports
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 24, out var allocateTexture) ? allocateTexture : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 80, out var eventObject) ? eventObject : 0,
                 EventCallback = TryReadUInt64(ctx, initDataAddress + 88, out var eventCallback) ? eventCallback : 0,
-                VideoDeliveryDisabled = IsAvPlayerTextureAllocatorBroken(),
+                TextureAllocatorFailed = IsAvPlayerTextureAllocatorBroken(),
             });
         }
 
@@ -207,7 +206,7 @@ public static class AvPlayerExports
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 32, out var allocateTexture) ? allocateTexture : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 88, out var eventObject) ? eventObject : 0,
                 EventCallback = TryReadUInt64(ctx, initDataAddress + 96, out var eventCallback) ? eventCallback : 0,
-                VideoDeliveryDisabled = IsAvPlayerTextureAllocatorBroken(),
+                TextureAllocatorFailed = IsAvPlayerTextureAllocatorBroken(),
             });
         }
 
@@ -346,6 +345,16 @@ public static class AvPlayerExports
                 return SetReturn(ctx, InvalidParameters);
             }
             player = foundPlayer;
+
+            // Astro Bot pauses immediately after receiving the first frame
+            // when its native texture allocator has been bypassed. There is
+            // no guest-owned texture lifecycle to suspend in this fallback
+            // mode, and honoring the pause leaves its intro state machine on
+            // a permanent black frame. Keep playback advancing to EOS.
+            if (IsAvPlayerTextureAllocatorBroken() && player.TextureAllocatorFailed)
+            {
+                return SetReturn(ctx, 0);
+            }
 
             player.Paused = true;
             player.PlaybackClock.Stop();
