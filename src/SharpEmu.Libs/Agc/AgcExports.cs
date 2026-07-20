@@ -262,6 +262,23 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_NO_TEXTURE_SKIP"),
         "1",
         StringComparison.Ordinal);
+    // Opt-in accounting for the submit-thread texture snapshot path. This is
+    // deliberately separate from Vulkan draw timings: guest-memory reads and
+    // detiling happen before work reaches the presenter, so renderer-only
+    // timings cannot expose this CPU cost.
+    private static readonly bool _traceTextureSnapshotDedup = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TEXTURE_SNAPSHOT_DEDUP"),
+        "1",
+        StringComparison.Ordinal);
+    private static long _textureSnapshotTraceNextTicks =
+        System.Diagnostics.Stopwatch.GetTimestamp() +
+        5 * System.Diagnostics.Stopwatch.Frequency;
+    private static long _textureSnapshotTraceCalls;
+    private static long _textureSnapshotTraceBindings;
+    private static long _textureSnapshotTraceUnique;
+    private static long _textureSnapshotTraceReused;
+    private static long _textureSnapshotTraceSharedBytes;
+    private static long _textureSnapshotTraceTicks;
     private static long _dcbWriteDataTraceCount;
     private static int _tracedVertexRangeCount;
     private static long _dcbWaitRegMemTraceCount;
@@ -4539,15 +4556,18 @@ public static partial class AgcExports
             : 0L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
 
     // How long a suspended GPU wait may sit before the deadlock breaker may
-    // release it using the last value a real producer wrote to its label. Long
-    // enough that legitimate GPU work (which completes within a frame) never
-    // trips it; short enough that a wedged cross-queue cycle unblocks quickly.
+    // release it using the last value a real producer wrote to its label. The
+    // default is immediate: the serial host parser commonly observes a reused
+    // label after the producer wrote and the guest reset it, and deferring each
+    // such dependency to a ThreadPool monitor serializes a frame into dozens of
+    // millisecond-scale wakeups. This path never fabricates a completion; the
+    // registry must contain a matching value written by a real producer.
     private static readonly long _gpuDeadlockBreakTicks =
         (long.TryParse(
              Environment.GetEnvironmentVariable("SHARPEMU_GPU_DEADLOCK_BREAK_MS"),
-             out var deadlockMs) && deadlockMs > 0
+             out var deadlockMs) && deadlockMs >= 0
             ? deadlockMs
-            : 500L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+            : 0L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
 
     // Reads the WAIT_REG_MEM watched address, reference, mask, and 3-bit compare
     // function for both the AGC NOP-encapsulated (RWaitMem32/64) and the standard
@@ -7377,17 +7397,52 @@ public static partial class AgcExports
         IReadOnlyList<TranslatedImageBinding> bindings,
         out int fallbackTextureCount)
     {
+        var traceStart = _traceTextureSnapshotDedup
+            ? System.Diagnostics.Stopwatch.GetTimestamp()
+            : 0L;
         var textures = new List<GuestDrawTexture>(bindings.Count);
+        // Shader metadata can reference the same image/sampler through many
+        // user-data slots. Astro Bot commonly binds one full-resolution image
+        // 9-17 times in a draw. Snapshotting each slot separately rereads and
+        // detiles the same guest allocation before the backend cache has a
+        // chance to observe the first copy. Preserve descriptor-slot ordering,
+        // but share the immutable GuestDrawTexture snapshot within this work
+        // item when every binding property is identical.
+        List<(TranslatedImageBinding Binding, GuestDrawTexture Texture)>? uniqueSnapshots =
+            bindings.Count > 1 ? new(bindings.Count) : null;
         fallbackTextureCount = 0;
+        var reusedSnapshotCount = 0;
+        long sharedPixelBytes = 0;
         foreach (var binding in bindings)
         {
-            if (TryCreateGuestDrawTexture(
+            GuestDrawTexture? texture = null;
+            if (uniqueSnapshots is not null)
+            {
+                foreach (var snapshot in uniqueSnapshots)
+                {
+                    if (TextureBindingsMatch(snapshot.Binding, binding))
+                    {
+                        texture = snapshot.Texture;
+                        reusedSnapshotCount++;
+                        sharedPixelBytes += texture.RgbaPixels.LongLength;
+                        break;
+                    }
+                }
+            }
+
+            if (texture is null &&
+                TryCreateGuestDrawTexture(
                     ctx,
                     binding.Descriptor,
                     binding.IsStorage,
                     binding.MipLevel,
                     binding.SamplerDescriptor,
-                    out var texture))
+                    out texture))
+            {
+                uniqueSnapshots?.Add((binding, texture));
+            }
+
+            if (texture is not null)
             {
                 textures.Add(texture);
                 if (texture.IsFallback)
@@ -7397,7 +7452,71 @@ public static partial class AgcExports
             }
         }
 
+        if (traceStart != 0)
+        {
+            Interlocked.Increment(ref _textureSnapshotTraceCalls);
+            Interlocked.Add(ref _textureSnapshotTraceBindings, bindings.Count);
+            Interlocked.Add(
+                ref _textureSnapshotTraceUnique,
+                bindings.Count - reusedSnapshotCount);
+            Interlocked.Add(ref _textureSnapshotTraceReused, reusedSnapshotCount);
+            Interlocked.Add(ref _textureSnapshotTraceSharedBytes, sharedPixelBytes);
+            Interlocked.Add(
+                ref _textureSnapshotTraceTicks,
+                System.Diagnostics.Stopwatch.GetTimestamp() - traceStart);
+            TraceTextureSnapshotDedupIfDue();
+        }
+
         return textures;
+    }
+
+    private static bool TextureBindingsMatch(
+        TranslatedImageBinding left,
+        TranslatedImageBinding right)
+    {
+        if (left.Descriptor != right.Descriptor ||
+            left.IsStorage != right.IsStorage ||
+            left.MipLevel != right.MipLevel ||
+            left.SamplerDescriptor.Count != right.SamplerDescriptor.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < left.SamplerDescriptor.Count; index++)
+        {
+            if (left.SamplerDescriptor[index] != right.SamplerDescriptor[index])
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void TraceTextureSnapshotDedupIfDue()
+    {
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var next = Volatile.Read(ref _textureSnapshotTraceNextTicks);
+        if (now < next ||
+            Interlocked.CompareExchange(
+                ref _textureSnapshotTraceNextTicks,
+                now + 5 * System.Diagnostics.Stopwatch.Frequency,
+                next) != next)
+        {
+            return;
+        }
+
+        var calls = Interlocked.Exchange(ref _textureSnapshotTraceCalls, 0);
+        var bindings = Interlocked.Exchange(ref _textureSnapshotTraceBindings, 0);
+        var unique = Interlocked.Exchange(ref _textureSnapshotTraceUnique, 0);
+        var reused = Interlocked.Exchange(ref _textureSnapshotTraceReused, 0);
+        var sharedBytes = Interlocked.Exchange(ref _textureSnapshotTraceSharedBytes, 0);
+        var ticks = Interlocked.Exchange(ref _textureSnapshotTraceTicks, 0);
+        Console.Error.WriteLine(
+            $"[LOADER][PERF] agc.texture_snapshot_dedup calls={calls} " +
+            $"bindings={bindings} unique={unique} reused={reused} " +
+            $"shared_mb={sharedBytes / (1024.0 * 1024.0):F1} " +
+            $"snapshot_ms={ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}");
     }
 
     /// <summary>

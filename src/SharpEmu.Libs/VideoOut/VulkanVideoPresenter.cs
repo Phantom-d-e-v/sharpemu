@@ -2649,13 +2649,41 @@ internal static unsafe class VulkanVideoPresenter
         return bytes;
     }
 
-    private static ulong GetTexturePayloadBytes(
+    internal static ulong GetTexturePayloadBytes(
         IReadOnlyList<GuestDrawTexture> textures)
     {
         var bytes = 0UL;
+        byte[]? firstPixels = null;
+        HashSet<byte[]>? uniquePixels = null;
         foreach (var texture in textures)
         {
-            bytes = SaturatingAdd(bytes, (ulong)texture.RgbaPixels.LongLength);
+            var pixels = texture.RgbaPixels;
+            if (pixels.Length == 0)
+            {
+                continue;
+            }
+
+            if (firstPixels is null)
+            {
+                firstPixels = pixels;
+                bytes = SaturatingAdd(bytes, (ulong)pixels.LongLength);
+                continue;
+            }
+
+            if (ReferenceEquals(firstPixels, pixels))
+            {
+                continue;
+            }
+
+            uniquePixels ??= new HashSet<byte[]>(
+                System.Collections.Generic.ReferenceEqualityComparer.Instance)
+            {
+                firstPixels,
+            };
+            if (uniquePixels.Add(pixels))
+            {
+                bytes = SaturatingAdd(bytes, (ulong)pixels.LongLength);
+            }
         }
 
         return bytes;
@@ -2901,6 +2929,12 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<(ulong Address, ulong Size)> _tracedGlobalWritebacks = new();
         private readonly HashSet<(ulong Shader, uint X, uint Y, uint Z, string Reason)>
             _rejectedComputeDispatches = new();
+        // Opt-in CPU-side breakdown for translated draws. Vulkan work is queued
+        // asynchronously, so this distinguishes resource creation/upload setup
+        // from command recording without adding a GPU fence or perturbing frame
+        // pacing. The cap keeps a pathological title from producing an
+        // unbounded boot log.
+        private int _vulkanDrawTimingLogCount;
         private int _tracedSmallGlobalWritebackEvents;
         private int _tracedLargeGlobalWritebackEvents;
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
@@ -10366,6 +10400,12 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteOffscreenDrawCore(VulkanOffscreenGuestDraw work)
         {
+            var timingStart = _traceVulkanDrawTimings
+                ? Stopwatch.GetTimestamp()
+                : 0L;
+            var pipelineCreationsBefore = _traceVulkanDrawTimings
+                ? Volatile.Read(ref _perfPipelineCreations)
+                : 0L;
             if (work.Targets.Count > _maxColorAttachments)
             {
                 Console.Error.WriteLine(
@@ -10604,6 +10644,9 @@ internal static unsafe class VulkanVideoPresenter
                     transientFramebuffer = framebuffer;
                 }
 
+                var resourceStart = timingStart != 0
+                    ? Stopwatch.GetTimestamp()
+                    : 0L;
                 resources = CreateTranslatedDrawResources(
                     draw,
                     renderPass,
@@ -10612,6 +10655,9 @@ internal static unsafe class VulkanVideoPresenter
                     targets,
                     hasDepthAttachment: depth is not null && !clearDepthSeparately,
                     feedbackDepth: clearDepthSeparately ? null : depth);
+                var resourceEnd = timingStart != 0
+                    ? Stopwatch.GetTimestamp()
+                    : 0L;
                 resources.TransientRenderPass = transientRenderPass;
                 resources.TransientFramebuffer = transientFramebuffer;
                 transientRenderPass = default;
@@ -10775,6 +10821,29 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 EndDebugLabel(_commandBuffer);
+
+                if (timingStart != 0)
+                {
+                    var recordEnd = Stopwatch.GetTimestamp();
+                    var totalMs = (recordEnd - timingStart) * 1000.0 / Stopwatch.Frequency;
+                    var resourceMs = (resourceEnd - resourceStart) * 1000.0 / Stopwatch.Frequency;
+                    var recordMs = (recordEnd - resourceEnd) * 1000.0 / Stopwatch.Frequency;
+                    var uploads = resources.Textures.Count(texture => texture.NeedsUpload);
+                    var pipelineCreated = Volatile.Read(ref _perfPipelineCreations) !=
+                        pipelineCreationsBefore;
+                    if ((totalMs >= 8.0 || uploads != 0 || pipelineCreated) &&
+                        _vulkanDrawTimingLogCount++ < 512)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.draw_timing " +
+                            $"seq={_activeGuestWorkSequence} ps=0x{work.ShaderAddress:X16} " +
+                            $"rt=0x{firstTarget.Address:X16} {firstTarget.Width}x{firstTarget.Height} " +
+                            $"total_ms={totalMs:F2} resources_ms={resourceMs:F2} " +
+                            $"record_ms={recordMs:F2} textures={resources.Textures.Length} " +
+                            $"uploads={uploads} pipeline_created={pipelineCreated} " +
+                            $"batch_draws={_batchDrawCount} pending_submissions={_pendingGuestSubmissions.Count}");
+                    }
+                }
 
                 var traceImages = GetTraceImages(resources, targets, work.ShaderAddress);
                 _batchTraceImages.AddRange(traceImages);
@@ -12553,6 +12622,7 @@ internal static unsafe class VulkanVideoPresenter
 
             TranslatedDrawResources? translatedResources = null;
             GuestImageResource? presentedGuestImage = null;
+            var tracePresentedGuestSource = false;
             var ownsPresentedGuestImageVersion = false;
             if (presentation.GuestImageVersion != 0)
             {
@@ -12597,6 +12667,10 @@ internal static unsafe class VulkanVideoPresenter
             if (presentedGuestImage is not null)
             {
                 _directPresentationCount++;
+                tracePresentedGuestSource =
+                    ShouldTracePresentedGuestImageContentsForDiagnostics() &&
+                    ShouldSamplePresentedGuestImageForDiagnostics(
+                        _directPresentationCount);
                 var traceAddressedPresentation =
                     ShouldTraceAddressedPresentedGuestImage(presentedGuestImage);
                 if (traceAddressedPresentation ||
@@ -12810,13 +12884,24 @@ internal static unsafe class VulkanVideoPresenter
                 _firstHostFramePresented = true;
                 NotifyFirstHostFramePresented(_hostSurface);
             }
-            if (_swapchainReadbackPending || !_pendingAliasImageDumps.IsEmpty)
+            if (_swapchainReadbackPending ||
+                tracePresentedGuestSource ||
+                !_pendingAliasImageDumps.IsEmpty)
             {
                 // Diagnostics read back GPU memory and need this frame done.
                 WaitFrameSlot(frameSlot);
                 if (_swapchainReadbackPending)
                 {
                     TraceSwapchainReadback();
+                }
+
+                // Pair the post-blit swapchain sample with the immutable flip
+                // source from the same presentation. If the source is nonblack
+                // but the swapchain is black, the defect is in format/transfer;
+                // if both are black, it is upstream in the final guest pass.
+                if (tracePresentedGuestSource && presentedGuestImage is not null)
+                {
+                    TraceGuestImageContents(presentedGuestImage);
                 }
 
                 while (_pendingAliasImageDumps.TryDequeue(out var aliasImage))
@@ -14100,6 +14185,11 @@ internal static unsafe class VulkanVideoPresenter
         private static readonly bool _traceVulkanResourcesEnabled =
             string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_LOG_VK_RESOURCES"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly bool _traceVulkanDrawTimings =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_VK_DRAW_TIMINGS"),
                 "1",
                 StringComparison.Ordinal);
         private static readonly bool _traceVulkanShaderEnabled =
