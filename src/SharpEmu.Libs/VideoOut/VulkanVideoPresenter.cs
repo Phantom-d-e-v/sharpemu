@@ -10211,6 +10211,8 @@ internal static unsafe class VulkanVideoPresenter
                     var changedPages = 0;
                     var writtenRuns = 0;
                     var writtenPages = 0;
+                    var fullPageFastPathPages = 0;
+                    var fullPageFastPathBytes = 0UL;
                     var failedRuns = 0;
                     var unreadablePages = 0;
                     var fallbackWrites = 0;
@@ -10251,6 +10253,30 @@ internal static unsafe class VulkanVideoPresenter
                             // merge against ordinary cached memory.
                             var mappedPage = mappedPageBuffer.AsSpan(0, pageLength);
                             mappedPageSource.CopyTo(mappedPage);
+                            var livePage = livePageBuffer.AsSpan(0, pageLength);
+
+                            // The usual case for a GPU-owned output page is
+                            // that the guest CPU has not touched it since the
+                            // last synchronization. In that case the whole
+                            // page can be published directly. Besides avoiding
+                            // a needless per-byte diff, this prevents dense
+                            // shader output (for example alternating component
+                            // writes) from becoming millions of tiny runs.
+                            // If guest memory differs from the shadow, retain
+                            // the conservative merge below so CPU changes are
+                            // never overwritten.
+                            if (memory.TryRead(guestAddress + (ulong)pageStart, livePage) &&
+                                livePage.SequenceEqual(shadowPage) &&
+                                memory.TryWrite(guestAddress + (ulong)pageStart, mappedPage))
+                            {
+                                mappedPage.CopyTo(shadowPage);
+                                changedPages++;
+                                writtenPages++;
+                                fullPageFastPathPages++;
+                                fullPageFastPathBytes += (ulong)pageLength;
+                                continue;
+                            }
+
                             pageRuns.Clear();
                             var cursor = 0;
                             while (cursor < pageLength)
@@ -10289,7 +10315,6 @@ internal static unsafe class VulkanVideoPresenter
                             }
 
                             changedPages++;
-                            var livePage = livePageBuffer.AsSpan(0, pageLength);
                             if (memory.TryRead(guestAddress + (ulong)pageStart, livePage))
                             {
                                 foreach (var run in pageRuns)
@@ -10446,6 +10471,8 @@ internal static unsafe class VulkanVideoPresenter
                             $"potential_bytes={mappedBytes.Length} changed_bytes={changedBytes} " +
                             $"changed_runs={changedRuns} changed_pages={changedPages} " +
                             $"written_pages={writtenPages} written_runs={writtenRuns} " +
+                            $"full_page_fast_path={fullPageFastPathPages}/" +
+                            $"{fullPageFastPathBytes} " +
                             $"unreadable_pages={unreadablePages} " +
                             $"fallback_writes={fallbackWrites} failed_runs={failedRuns} " +
                             $"probe_nonzero={nonzero}/{probe.Length} " +
