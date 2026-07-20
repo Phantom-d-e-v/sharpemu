@@ -1196,25 +1196,48 @@ public static class KernelRuntimeCompatExports
         // __stack_chk_fail on boot. Image base is 0x800000000, so this is stable.
         // jneAddress may also be passed in (retAddr - 0x1C) when called from the
         // trip itself, in case the image base ever differs.
+        // We ALSO patch the `ud2` (0F 0B) at 0x800FCB2E4 to `ret` (C3). The
+        // function's only code after `call __stack_chk_fail` is that ud2 (the
+        // compiler's noreturn trap), so when we resume the function at its entry
+        // (0x800FCB2C4) the epilogue ret at 0x800FCB2DE fires first and the
+        // patched ud2 is never reached — but if control ever falls through, it
+        // now also returns cleanly instead of trapping.
         var jne = (IntPtr)jneAddress;
         try
         {
-            if (!HostMemory.Protect((void*)jne, 2u, HostMemory.PAGE_EXECUTE_READWRITE, out var oldProtect))
+            if (HostMemory.Protect((void*)jne, 2u, HostMemory.PAGE_EXECUTE_READWRITE, out var oldProtect))
             {
-                return;
+                try
+                {
+                    Marshal.WriteByte(jne, 0x90);      // 75 -> NOP
+                    Marshal.WriteByte(jne + 1, 0x90);  // 15 -> NOP
+                    HostMemory.FlushInstructionCache((void*)jne, 2u);
+                    _astroCanaryCheckNeutralized = true;
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] PPSA21564 canary check neutralized at 0x{(ulong)jne:X16} (jne -> nop nop)");
+                }
+                finally
+                {
+                    HostMemory.Protect((void*)jne, 2u, oldProtect, out _);
+                }
             }
-            try
+
+            // Patch the ud2 cold-path (0x800FCB2E4) to ret so any fall-through also returns.
+            var ud2 = (IntPtr)0x0000000800FCB2E4uL;
+            if (HostMemory.Protect((void*)ud2, 2u, HostMemory.PAGE_EXECUTE_READWRITE, out var oldProtect2))
             {
-                Marshal.WriteByte(jne, 0x90);      // 75 -> NOP
-                Marshal.WriteByte(jne + 1, 0x90);  // 15 -> NOP
-                HostMemory.FlushInstructionCache((void*)jne, 2u);
-                _astroCanaryCheckNeutralized = true;
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] PPSA21564 canary check neutralized at 0x{(ulong)jne:X16} (jne -> nop nop)");
-            }
-            finally
-            {
-                HostMemory.Protect((void*)jne, 2u, oldProtect, out _);
+                try
+                {
+                    Marshal.WriteByte(ud2, 0xC3);      // 0F 0B -> C3 (ret; 2nd byte unused)
+                    Marshal.WriteByte(ud2 + 1, 0x90);  // pad
+                    HostMemory.FlushInstructionCache((void*)ud2, 2u);
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] PPSA21564 canary ud2 cold-path patched to ret at 0x{(ulong)ud2:X16}");
+                }
+                finally
+                {
+                    HostMemory.Protect((void*)ud2, 2u, oldProtect2, out _);
+                }
             }
         }
         catch
@@ -1274,30 +1297,30 @@ public static class KernelRuntimeCompatExports
                 {
                     // PPSA21564 (Astro Bot) canary recovery. The HLE import
                     // bridge enters this export with [RSP] already set to the
-                    // function's canary-check site (0x800FCB2C4). The dumped
+                    // function's canary-check site (0x800FCB2C4) — which is the
+                    // function's true entry the JIT authorized. The dumped
                     // function layout (verified from guest bytes) is:
-                    //   0x...2C4: 48 3B 45 D0        cmp rbp, rsp
+                    //   0x...2C4: 48 3B 45 D0        cmp rbp, rsp   (function entry)
                     //   0x...2C8: 75 15              jne <fail>  (neutralized -> 90 90)
-                    //   0x...2CA: 48 89 F8           mov rax, rdi   <-- resume here
+                    //   0x...2CA: 48 89 F8           mov rax, rdi
                     //   0x...2CD: 48 81 C4 48 1E.. add rsp, 0x1E48
                     //   0x...2D4: 5B 41 5C ...       pop rbx..r15, pop rbp
                     //   0x...2DE: C3                 ret
-                    //   0x...2DF: E8 ....            call __stack_chk_fail (ud2 cold path)
-                    //   0x...2E4: 0F 0B             ud2
-                    // Resuming at the `mov rax,rdi` (+6 from the check site)
-                    // runs the now-valid epilogue: RAX = RDI (the ctx ptr the
-                    // caller expects), tears down the frame, and RETs cleanly to
-                    // the caller. RAX is pre-set to RDI for safety. This skips
-                    // the ud2 cold path entirely. The backend resumes guest
-                    // execution at whatever [RSP] holds on export return.
-                    var resume = retAddr + 0x6uL;
-                    if (ctx.TryWriteUInt64(ctx[CpuRegister.Rsp], resume))
-                    {
-                        ctx[CpuRegister.Rax] = ctx[CpuRegister.Rdi];
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip recovered (resumed epilogue) ret=0x{retAddr:X16} -> 0x{resume:X16}");
-                        return 0;
-                    }
+                    //   0x...2DF: E8 ....            call __stack_chk_fail
+                    //   0x...2E4: 0F 0B             ud2  (patched -> C3 ret)
+                    // We resume at the FUNCTION ENTRY (retAddr = 0x800FCB2C4),
+                    // NOT at +6, because the direct-execution backend rejects
+                    // mid-function resumption (it throws 0x80000003 int3 when
+                    // given 0x800FCB2CA). The entry is already JIT-authorized,
+                    // so resuming there runs: cmp (passes) -> mov rax,rdi ->
+                    // add rsp -> pop* -> ret (0x800FCB2DE) -> returns cleanly
+                    // to the function's REAL caller. RAX is pre-set to RDI.
+                    // The ud2 at 0x800FCB2E4 is separately patched to `ret` as
+                    // a fall-through safety net.
+                    ctx[CpuRegister.Rax] = ctx[CpuRegister.Rdi];
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] __stack_chk_fail#{count}: PPSA21564 canary trip recovered (resumed function entry) ret=0x{retAddr:X16}");
+                    return 0;
                 }
             }
             catch
