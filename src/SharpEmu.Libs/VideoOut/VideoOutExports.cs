@@ -243,6 +243,22 @@ public static class VideoOutExports
         uint Height,
         uint PitchInPixel);
 
+    /// <summary>
+    /// Maps a registered scanout buffer to the CB data-format fields used by
+    /// translated offscreen draws. Unity's PS5 final blit can omit CB registers
+    /// and rely on the flip to name the display surface.
+    /// </summary>
+    internal static bool TryGetDisplayRenderTargetFormat(
+        in DisplayBufferInfo buffer,
+        out uint format,
+        out uint numberType)
+    {
+        format = MapPixelFormatToGuestTextureFormat(buffer.PixelFormat);
+        numberType = 0;
+        return format != 0 &&
+               VulkanVideoPresenter.TryDecodeRenderTargetFormat(format, numberType, out _);
+    }
+
     [SysAbiExport(
         Nid = "Up36PTk687E",
         ExportName = "sceVideoOutOpen",
@@ -850,25 +866,63 @@ public static class VideoOutExports
                 return false;
             }
 
-            var slot = port.BufferSlots[bufferIndex];
-            if (slot.AddressLeft == 0 ||
-                slot.GroupIndex < 0 ||
-                slot.GroupIndex >= port.Groups.Length ||
-                port.Groups[slot.GroupIndex] is not { } group)
-            {
-                return false;
-            }
-
-            var attribute = group.Attribute;
-            info = new DisplayBufferInfo(
-                slot.AddressLeft,
-                attribute.PixelFormat,
-                attribute.TilingMode,
-                attribute.Width,
-                attribute.Height,
-                attribute.PitchInPixel);
-            return true;
+            return TryGetDisplayBufferInfo(port, bufferIndex, out info);
         }
+    }
+
+    internal static bool IsRegisteredDisplayBufferAddress(ulong address)
+    {
+        if (address == 0)
+        {
+            return false;
+        }
+
+        lock (_stateGate)
+        {
+            foreach (var port in _ports.Values)
+            {
+                foreach (var slot in port.BufferSlots)
+                {
+                    if (slot.GroupIndex < 0)
+                    {
+                        continue;
+                    }
+
+                    if (slot.AddressLeft == address || slot.AddressRight == address)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetDisplayBufferInfo(
+        VideoOutPortState port,
+        int bufferIndex,
+        out DisplayBufferInfo info)
+    {
+        info = default;
+        var slot = port.BufferSlots[bufferIndex];
+        if (slot.AddressLeft == 0 ||
+            slot.GroupIndex < 0 ||
+            slot.GroupIndex >= port.Groups.Length ||
+            port.Groups[slot.GroupIndex] is not { } group)
+        {
+            return false;
+        }
+
+        var attribute = group.Attribute;
+        info = new DisplayBufferInfo(
+            slot.AddressLeft,
+            attribute.PixelFormat,
+            attribute.TilingMode,
+            attribute.Width,
+            attribute.Height,
+            attribute.PitchInPixel);
+        return true;
     }
 
     [SysAbiExport(

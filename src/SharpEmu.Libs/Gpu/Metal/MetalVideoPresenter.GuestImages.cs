@@ -192,6 +192,33 @@ internal static partial class MetalVideoPresenter
     public static long CurrentGuestWorkSequenceForDiagnostics =>
         Volatile.Read(ref _executingGuestWorkSequence);
 
+    public static long GetSubmittingGuestQueueTail()
+    {
+        lock (_gate)
+        {
+            return CurrentSubmittingQueueTailLocked();
+        }
+    }
+
+    public static void WaitForGuestImageGpuWrite(ulong address)
+    {
+        if (address == 0)
+        {
+            return;
+        }
+
+        long workSequence;
+        lock (_gate)
+        {
+            if (!_guestImageWorkSequences.TryGetValue(address, out workSequence))
+            {
+                return;
+            }
+        }
+
+        WaitForGuestWork(workSequence, Timeout.Infinite);
+    }
+
     public static bool WaitForGuestWork(long workSequence, int timeoutMilliseconds)
     {
         if (workSequence <= 0)

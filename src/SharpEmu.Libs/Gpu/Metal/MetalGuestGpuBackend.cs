@@ -395,6 +395,12 @@ internal sealed class MetalGuestGpuBackend : IGuestGpuBackend
     public bool WaitForGuestWork(long workSequence, int timeoutMilliseconds = Timeout.Infinite) =>
         MetalVideoPresenter.WaitForGuestWork(workSequence, timeoutMilliseconds);
 
+    public long GetSubmittingGuestQueueTail() =>
+        MetalVideoPresenter.GetSubmittingGuestQueueTail();
+
+    public void WaitForGuestImageGpuWrite(ulong address) =>
+        MetalVideoPresenter.WaitForGuestImageGpuWrite(address);
+
     public long CurrentGuestWorkSequenceForDiagnostics =>
         MetalVideoPresenter.CurrentGuestWorkSequenceForDiagnostics;
 

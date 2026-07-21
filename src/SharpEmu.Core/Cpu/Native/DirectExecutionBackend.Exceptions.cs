@@ -614,9 +614,32 @@ public sealed partial class DirectExecutionBackend
 		void* contextRecord,
 		ulong rip)
 	{
+		// TBB worker threads occasionally fault after a bad task pointer:
+		//  1) NX/execute fault with RIP outside the guest image (legacy path)
+		//  2) data AV in guest code against a null/poison object
+		//     (e.g. read target 0xFFFFFFFFFFFFFFB1 ~= null-derived negative offset)
+		// Both are recoverable by retiring the worker entry to the host return stub.
 		if (exceptionRecord->ExceptionCode != 3221225477u ||
-			rip >= 0x0000000800000000UL ||
 			_activeGuestThreadState is not { Name: "tbb_thead" } activeThread)
+		{
+			return false;
+		}
+
+		var accessTarget = exceptionRecord->NumberParameters >= 2
+			? exceptionRecord->ExceptionInformation[1]
+			: 0UL;
+		var isExecuteFault = rip < 0x0000000800000000UL;
+		var isPoisonDataFault =
+			!isExecuteFault &&
+			rip >= 0x0000000800000000UL &&
+			IsAuxiliaryTbbPoisonAccessTarget(accessTarget);
+		if (!isExecuteFault && !isPoisonDataFault)
+		{
+			return false;
+		}
+
+		// Cap recoveries so a permanently broken task queue cannot spin forever.
+		if (Volatile.Read(ref _auxiliaryThreadExecuteFaultRecoveries) >= 256)
 		{
 			return false;
 		}
@@ -629,19 +652,35 @@ public sealed partial class DirectExecutionBackend
 		if (hostExit < 0x10000)
 		{
 			Console.Error.WriteLine(
-				$"[LOADER][WARN] Could not recover auxiliary TBB execute fault: target=0x{rip:X16} " +
-				$"active_exit=0x{ActiveEntryReturnSentinelRip:X16} guest_return_stub=0x{unchecked((ulong)_guestReturnStub):X16}");
+				$"[LOADER][WARN] Could not recover auxiliary TBB fault: rip=0x{rip:X16} " +
+				$"access=0x{accessTarget:X16} active_exit=0x{ActiveEntryReturnSentinelRip:X16} " +
+				$"guest_return_stub=0x{unchecked((ulong)_guestReturnStub):X16}");
 			return false;
 		}
 
 		_ = TryPatchActiveGuestReturnSlot(hostExit);
-		WriteCtxU64(contextRecord, 120, 0);
-		WriteCtxU64(contextRecord, 248, hostExit);
+		WriteCtxU64(contextRecord, CTX_RAX, 0);
+		WriteCtxU64(contextRecord, CTX_RIP, hostExit);
 		var recovery = Interlocked.Increment(ref _auxiliaryThreadExecuteFaultRecoveries);
+		var kind = isPoisonDataFault ? "poison-data" : "execute";
 		Console.Error.WriteLine(
-			$"[LOADER][WARN] Recovered auxiliary TBB execute fault #{recovery}: " +
-			$"thread=0x{activeThread.ThreadHandle:X16} target=0x{rip:X16} -> host_exit=0x{hostExit:X16}");
+			$"[LOADER][WARN] Recovered auxiliary TBB {kind} fault #{recovery}: " +
+			$"thread=0x{activeThread.ThreadHandle:X16} rip=0x{rip:X16} " +
+			$"access=0x{accessTarget:X16} -> host_exit=0x{hostExit:X16}");
 		return true;
+	}
+
+	private static bool IsAuxiliaryTbbPoisonAccessTarget(ulong target)
+	{
+		// Near-null page / small C++ member offsets from a null this-pointer.
+		if (target < 0x10000UL)
+		{
+			return true;
+		}
+
+		// High canonical poison / negative offsets from null
+		// (0xFFFFFFFFFFFFFFB1 == -0x4F observed on PPSA21564 Astro Bot).
+		return target >= 0xFFFFFFFFFFFF0000UL;
 	}
 
 	private unsafe bool TryRecoverGuestInt41(uint exceptionCode, void* contextRecord, ulong rip)

@@ -375,6 +375,12 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
     public bool WaitForGuestWork(long workSequence, int timeoutMilliseconds = Timeout.Infinite) =>
         VulkanVideoPresenter.WaitForGuestWork(workSequence, timeoutMilliseconds);
 
+    public long GetSubmittingGuestQueueTail() =>
+        VulkanVideoPresenter.GetSubmittingGuestQueueTail();
+
+    public void WaitForGuestImageGpuWrite(ulong address) =>
+        VulkanVideoPresenter.WaitForGuestImageGpuWrite(address);
+
     public long CurrentGuestWorkSequenceForDiagnostics =>
         VulkanVideoPresenter.CurrentGuestWorkSequenceForDiagnostics;
 

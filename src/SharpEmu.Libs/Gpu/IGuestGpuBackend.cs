@@ -222,6 +222,12 @@ internal interface IGuestGpuBackend
     /// close, or a non-positive sequence.</summary>
     bool WaitForGuestWork(long workSequence, int timeoutMilliseconds = Timeout.Infinite);
 
+    /// <summary>Tail work sequence for the queue currently being submitted.</summary>
+    long GetSubmittingGuestQueueTail();
+
+    /// <summary>Blocks until the last GPU write to a guest image address completes.</summary>
+    void WaitForGuestImageGpuWrite(ulong address);
+
     /// <summary>Sequence currently executing on the guest-work consumer; diagnostics only.</summary>
     long CurrentGuestWorkSequenceForDiagnostics { get; }
 

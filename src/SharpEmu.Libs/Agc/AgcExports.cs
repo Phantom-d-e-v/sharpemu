@@ -3410,13 +3410,24 @@ public static partial class AgcExports
                 var flipArg = unchecked((long)(((ulong)flipArgHi << 32) | flipArgLo));
                 var displayBufferIndex = unchecked((int)displayBufferIndexRaw);
                 var handle = unchecked((int)videoOutHandle);
+                var pendingTargetless = state.PendingTargetlessDraw is not null;
+                var scanoutAddress = VideoOutExports.TryGetDisplayBufferInfo(
+                    handle,
+                    displayBufferIndex,
+                    out var rflipDisplayBuffer)
+                    ? rflipDisplayBuffer.Address
+                    : 0UL;
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] agc.rflip pending_targetless={pendingTargetless.ToString().ToLowerInvariant()} " +
+                    $"handle={handle} buf={displayBufferIndex} scanout=0x{scanoutAddress:X16}");
                 if (state.PendingTargetlessDraw is { } pendingComposite &&
                     VideoOutExports.TryGetDisplayBufferInfo(
                         handle,
                         displayBufferIndex,
                         out var pendingDisplayBuffer) &&
-                    state.KnownRenderTargets.TryGetValue(
-                        pendingDisplayBuffer.Address,
+                    TryResolveDeferredCompositeTarget(
+                        state,
+                        pendingDisplayBuffer,
                         out var pendingDisplayTarget))
                 {
                     var textures = CreateGuestDrawTextures(
@@ -3424,9 +3435,18 @@ public static partial class AgcExports
                         pendingComposite.Textures,
                         out _);
                     var globalMemoryBuffers =
-                        CreateTranslatedDrawGlobalBuffers(pendingComposite);
+                        CreateTranslatedDrawGlobalBuffersForPresent(ctx, pendingComposite);
                     var vertexBuffers =
                         CreateGuestVertexBuffers(pendingComposite.VertexInputs);
+                    if (pendingComposite.Textures.FirstOrDefault() is { } compositeSourceBinding &&
+                        compositeSourceBinding.Descriptor.Address != 0)
+                    {
+                        TraceDeferredCompositeSourceSample(
+                            ctx,
+                            compositeSourceBinding.Descriptor,
+                            tag: "pre");
+                    }
+
                     ProvideRenderTargetInitialData(ctx, pendingDisplayTarget);
                     GuestGpu.Current.SubmitOffscreenTranslatedDraw(
                         pendingComposite.PixelShader,
@@ -3451,6 +3471,11 @@ public static partial class AgcExports
                         pendingComposite.FirstIndex,
                         pendingComposite.VertexOffset,
                         pendingComposite.FirstInstance);
+                    Console.Error.WriteLine(
+                        $"[LOADER][INFO] agc.deferred_composite ps=0x{pendingComposite.PixelShaderAddress:X16} " +
+                        $"src=0x{pendingComposite.Textures.FirstOrDefault()?.Descriptor.Address ?? 0:X16} " +
+                        $"dst=0x{pendingDisplayTarget.Address:X16} " +
+                        $"size={pendingDisplayTarget.Width}x{pendingDisplayTarget.Height}");
                     TraceAgcShader(
                         $"agc.deferred_composite ps=0x{pendingComposite.PixelShaderAddress:X16} " +
                         $"src=0x{pendingComposite.Textures.FirstOrDefault()?.Descriptor.Address ?? 0:X16} " +
@@ -3615,6 +3640,237 @@ public static partial class AgcExports
             $"[FRAMEPKT] parse-failure queue={state.QueueName} " +
             $"submission={state.ActiveSubmissionId} offset={offset} " +
             $"address=0x{address:X16} header=0x{header:X8} reason={reason}");
+    }
+
+    /// <summary>
+    /// Resumes suspended GPU waits after an ordered ReleaseMem/WriteData side
+    /// effect completes on the presenter thread. Without this, wakeups depend
+    /// on the ThreadPool monitor and AGC submit cadence, which leaves compute
+    /// queues suspended while the guest-work backlog grows.
+    /// </summary>
+    internal static void DrainSuspendedWaitsForGuestMemory(SharpEmu.HLE.ICpuMemory memory)
+    {
+        if (!_gpuWaitSuspendEnabled || memory is null)
+        {
+            return;
+        }
+
+        if (!_submittedGpuStates.TryGetValue(memory, out var gpuState))
+        {
+            return;
+        }
+
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        if (!Monitor.TryEnter(gpuState.Gate, 0))
+        {
+            lock (gpuState.WaitMonitorSignalGate)
+            {
+                gpuState.WaitMonitorSignalVersion++;
+                Monitor.Pulse(gpuState.WaitMonitorSignalGate);
+            }
+
+            return;
+        }
+
+        try
+        {
+            var resumed = DrainResumableDcbs(ctx, gpuState, tracePackets: false);
+            if (resumed == 0)
+            {
+                return;
+            }
+
+            lock (gpuState.WaitMonitorSignalGate)
+            {
+                gpuState.WaitMonitorSignalVersion++;
+                Monitor.Pulse(gpuState.WaitMonitorSignalGate);
+            }
+        }
+        finally
+        {
+            Monitor.Exit(gpuState.Gate);
+        }
+    }
+
+    private static bool TryResolveDeferredCompositeTarget(
+        SubmittedDcbState state,
+        VideoOutExports.DisplayBufferInfo displayBuffer,
+        out RenderTargetDescriptor target)
+    {
+        if (state.KnownRenderTargets.TryGetValue(displayBuffer.Address, out target))
+        {
+            return true;
+        }
+
+        if (!VideoOutExports.TryGetDisplayRenderTargetFormat(
+                displayBuffer,
+                out var format,
+                out var numberType))
+        {
+            target = default;
+            return false;
+        }
+
+        target = new RenderTargetDescriptor(
+            Slot: 0,
+            Address: displayBuffer.Address,
+            Width: displayBuffer.Width,
+            Height: displayBuffer.Height,
+            Format: format,
+            NumberType: numberType,
+            TileMode: displayBuffer.TilingMode);
+        state.KnownRenderTargets[displayBuffer.Address] = target;
+        return true;
+    }
+
+    private static bool ShouldRetainTargetlessDrawUntilFlip(
+        TranslatedGuestDraw draw,
+        uint vertexCount)
+    {
+        if (draw.Textures.Count != 1 ||
+            draw.DepthTarget is not null ||
+            draw.Textures.Any(binding => binding.IsStorage))
+        {
+            return false;
+        }
+
+        var firstTarget = draw.RenderTargets.FirstOrDefault();
+        if (firstTarget.Address == 0)
+        {
+            return true;
+        }
+
+        // Unity's final present blit can leave a stale non-display CB bound.
+        // Only defer that single-textured HDR feeder blit until RFlip names scanout.
+        if (vertexCount > 6 ||
+            draw.RenderTargets.Count > 1 ||
+            VideoOutExports.IsRegisteredDisplayBufferAddress(firstTarget.Address))
+        {
+            return false;
+        }
+
+        var source = draw.Textures[0].Descriptor;
+        return source.Format is 6 or 7 &&
+            source.Width >= 1920 &&
+            source.Height >= 1080;
+    }
+
+    private static void TrySubmitEvictedPendingTargetlessDrawOffscreen(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        TranslatedGuestDraw draw)
+    {
+        var firstTarget = draw.RenderTargets.FirstOrDefault();
+        if (firstTarget.Address == 0)
+        {
+            return;
+        }
+
+        foreach (var target in draw.RenderTargets)
+        {
+            if (target.Address != 0)
+            {
+                state.KnownRenderTargets[target.Address] = target;
+                ProvideRenderTargetInitialData(ctx, target);
+            }
+        }
+
+        var textures = CreateGuestDrawTextures(ctx, draw.Textures, out _);
+        var globalMemoryBuffers = CreateTranslatedDrawGlobalBuffers(draw);
+        var vertexBuffers = CreateGuestVertexBuffers(draw.VertexInputs);
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] agc.pending_targetless_evict_submit ps=0x{draw.PixelShaderAddress:X16} " +
+            $"textures={draw.Textures.Count} target=0x{firstTarget.Address:X16}");
+        TraceHdrFeederOffscreenSubmit(firstTarget.Address, draw.PixelShaderAddress, "evict");
+        GuestGpu.Current.SubmitOffscreenTranslatedDraw(
+            draw.PixelShader,
+            textures,
+            globalMemoryBuffers,
+            draw.AttributeCount,
+            draw.GuestTargets,
+            draw.VertexShader,
+            draw.VertexCount,
+            draw.InstanceCount,
+            draw.PrimitiveType,
+            draw.IndexBuffer,
+            vertexBuffers,
+            draw.RenderState,
+            draw.DepthTarget,
+            draw.PixelShaderAddress,
+            draw.FirstIndex,
+            draw.VertexOffset,
+            draw.FirstInstance);
+    }
+
+    private static void TraceHdrFeederOffscreenSubmit(
+        ulong targetAddress,
+        ulong pixelShaderAddress,
+        string path)
+    {
+        if ((targetAddress & 0xFFFF0000UL) != 0x53D40000UL &&
+            pixelShaderAddress != 0x500652400UL)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] agc.hdr_feeder_offscreen path={path} ps=0x{pixelShaderAddress:X16} " +
+            $"target=0x{targetAddress:X16}");
+    }
+
+    private static void TraceDeferredCompositeSourceSample(
+        CpuContext ctx,
+        TextureDescriptor source,
+        string tag = "pre")
+    {
+        const int sampleBytes = 65536;
+        var buffer = new byte[sampleBytes];
+        if (!ctx.Memory.TryRead(source.Address, buffer))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] agc.deferred_composite_src_{tag} addr=0x{source.Address:X16} " +
+                $"size={source.Width}x{source.Height} fmt={source.Format} read=false");
+            return;
+        }
+
+        var unique = new HashSet<uint>();
+        var nonZero = 0;
+        for (var offset = 0; offset + 4 <= buffer.Length; offset += 4)
+        {
+            var word = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(offset, 4));
+            unique.Add(word);
+            if (word != 0)
+            {
+                nonZero++;
+            }
+        }
+
+        var centerOffset = (int)Math.Min(
+            (ulong)(source.Width / 2u * 4u),
+            (ulong)(buffer.Length - 4));
+        var center = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(centerOffset, 4));
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] agc.deferred_composite_src_{tag} addr=0x{source.Address:X16} " +
+            $"size={source.Width}x{source.Height} fmt={source.Format} " +
+            $"sample_unique={unique.Count} sample_nonzero={nonZero} center=0x{center:X8}");
+    }
+
+    private static void AssignPendingTargetlessDraw(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        TranslatedGuestDraw draw)
+    {
+        if (state.PendingTargetlessDraw is { } previous &&
+            !ReferenceEquals(previous, draw))
+        {
+            TrySubmitEvictedPendingTargetlessDrawOffscreen(ctx, state, previous);
+        }
+
+        state.PendingTargetlessDraw = draw;
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] agc.pending_targetless_set ps=0x{draw.PixelShaderAddress:X16} " +
+            $"textures={draw.Textures.Count} " +
+            $"target=0x{draw.RenderTargets.FirstOrDefault().Address:X16}");
     }
 
     private static void TraceDisplayBuffer(
@@ -5511,15 +5767,6 @@ public static partial class AgcExports
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var renderTargets = GetRenderTargets(state.CxRegisters);
         var drawSequence = ++gpuState.WorkSequence;
-        if (state.PendingTargetlessDraw is { } stalePendingDraw)
-        {
-            ReturnPooledDrawArrays(
-                stalePendingDraw,
-                globals: true,
-                vertex: true,
-                index: true);
-            state.PendingTargetlessDraw = null;
-        }
         state.TranslatedDraw = null;
         state.GuestDrawKind = GuestDrawKind.None;
         foreach (var target in renderTargets)
@@ -5704,7 +5951,11 @@ public static partial class AgcExports
             }
 
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
-            if (firstTarget.Address != 0)
+            if (ShouldRetainTargetlessDrawUntilFlip(translatedDraw, vertexCount))
+            {
+                AssignPendingTargetlessDraw(ctx, state, translatedDraw);
+            }
+            else if (firstTarget.Address != 0)
             {
                 // Render every bound color target. A deferred G-buffer draw
                 // writes several targets in one guest pass; we render one bound
@@ -5745,6 +5996,10 @@ public static partial class AgcExports
                 {
                     if (renderTarget.Address != 0)
                     {
+                        TraceHdrFeederOffscreenSubmit(
+                            renderTarget.Address,
+                            translatedDraw.PixelShaderAddress,
+                            "offscreen");
                         ProvideRenderTargetInitialData(ctx, renderTarget);
                     }
                 }
@@ -5844,25 +6099,13 @@ public static partial class AgcExports
                     }
                     else
                     {
-                        if (translatedDraw.Textures.Count != 0)
-                        {
-                            // Unity's PS5 final blit can omit CB registers and
-                            // rely on the following AGC flip to name the scanout
-                            // target. Retain that sampled draw until RFlip, then
-                            // enqueue it against the known display surface before
-                            // the ordered capture.
-                            state.PendingTargetlessDraw = translatedDraw;
-                        }
-                        else
-                        {
-                            // No render target, storage sink or sampled source:
-                            // nothing can consume this draw.
-                            ReturnPooledDrawArrays(
-                                translatedDraw,
-                                globals: true,
-                                vertex: true,
-                                index: true);
-                        }
+                        // No render target, storage sink or sampled source:
+                        // nothing can consume this draw.
+                        ReturnPooledDrawArrays(
+                            translatedDraw,
+                            globals: true,
+                            vertex: true,
+                            index: true);
                     }
                 }
             }
