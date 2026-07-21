@@ -7518,14 +7518,24 @@ internal static unsafe class VulkanVideoPresenter
                     return;
                 }
 
-                // Prefer an exact descriptor match. Initialization is important,
-                // but it must not make a differently sized alias outrank the image
-                // that the texture descriptor actually names.
+                // Prefer an exact descriptor match, but never let an empty
+                // exact-format variant beat an initialized GPU image at the
+                // same address (Astro Bot multiplexes float16 HDR and
+                // B10G11R11 at 0x53AA00000 — sampling the empty packed11
+                // variant made the HDR feeder draw black).
                 var score = 0;
                 if (candidate.Width == texture.Width &&
                     candidate.Height == texture.Height)
                 {
                     score += 32;
+                }
+                if (candidate.Initialized && !candidate.IsCpuBacked)
+                {
+                    score += 64;
+                }
+                else if (candidate.Initialized)
+                {
+                    score += 20;
                 }
                 if (candidate.Format == viewFormat)
                 {
@@ -7538,14 +7548,6 @@ internal static unsafe class VulkanVideoPresenter
                 else if (GuestTextureFormatsMatch(candidate.GuestFormat, guestFormat))
                 {
                     score += 6;
-                }
-                if (candidate.Initialized)
-                {
-                    score += 4;
-                }
-                if (candidate.Initialized && !candidate.IsCpuBacked)
-                {
-                    score += 12;
                 }
                 if (candidate.MipLevels == texture.ResourceMipLevels)
                 {
@@ -7601,7 +7603,12 @@ internal static unsafe class VulkanVideoPresenter
             GuestImageResource guestImage) =>
             texture.BaseMipLevel < guestImage.MipLevels &&
             IsCompatibleGuestImageAlias(texture, guestImage) &&
-            IsCompatibleViewFormat(guestImage.Format, viewFormat);
+            (IsCompatibleViewFormat(guestImage.Format, viewFormat) ||
+             // Allow initialized GPU images through even when the descriptor
+             // format class differs; TryGetOrCreateGuestImageAliasView falls
+             // back to the native image format so float16 HDR content is not
+             // discarded in favour of an empty B10G11R11 sibling variant.
+             (guestImage.Initialized && !guestImage.IsCpuBacked));
 
         private bool TryGetOrCreateGuestImageAliasView(
             GuestImageResource guestImage,
@@ -13752,7 +13759,8 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         private static bool IsHdrFeederGuestAddress(ulong address) =>
-            address != 0 && (address & 0xFFFF0000UL) == 0x000000053D400000UL;
+            address is 0x000000053D410000UL or 0x000000053C2F0000UL ||
+            (address & 0xFFFFFFFFFFF00000UL) is 0x000000053D400000UL or 0x000000053C200000UL;
 
         private void TracePublishedOffscreenTargetsAfterFlush(
             GuestImageResource[] targets,

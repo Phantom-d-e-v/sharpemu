@@ -3807,8 +3807,10 @@ public static partial class AgcExports
         ulong pixelShaderAddress,
         string path)
     {
-        if ((targetAddress & 0xFFFF0000UL) != 0x53D40000UL &&
-            pixelShaderAddress != 0x500652400UL)
+        var isHdrFeederAddress =
+            targetAddress is 0x000000053D410000UL or 0x000000053C2F0000UL ||
+            (targetAddress & 0xFFFFFFFFFFF00000UL) is 0x000000053D400000UL or 0x000000053C200000UL;
+        if (!isHdrFeederAddress && pixelShaderAddress != 0x500652400UL)
         {
             return;
         }
